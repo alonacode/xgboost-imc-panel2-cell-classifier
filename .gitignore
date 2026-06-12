@@ -1,0 +1,13 @@
+/XGBoost_classifier/Panel_2_10/img/*
+/XGBoost_classifier/Panel_2_10/IMMUcan_panel_2_2.10_compensation/*
+/XGBoost_classifier/Panel_2_10/gates/*
+/XGBoost_classifier/Panel_2_10/intensities/*
+/XGBoost_classifier/Panel_2_10/masks/*
+/XGBoost_classifier/Panel_2_10/neighbors/*
+/XGBoost_classifier/Panel_2_10/raw/*
+/XGBoost_classifier/Panel_2_10/regionprops/*
+/XGBoost_classifier/Panel_2_10/Rout/*
+
+!XGBoost_classifier/Panel_2_10/*/.gitkeep
+
+.DS_Store
