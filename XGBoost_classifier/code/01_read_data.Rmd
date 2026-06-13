@@ -2,6 +2,10 @@
 title: "01_read_data"
 ---
 
+link to presentation
+
+https://docs.google.com/presentation/d/1j092IUsKge5XvswE18HGZPmz4NGRUtOXNunP9SOr3i0/edit?usp=sharing
+
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
 ```
@@ -157,7 +161,6 @@ Now we rewrote the assays in our spe to compensated
 
 
 
-
 ## already gated (labelled) images
 
 USL - the group of colorectal cancer (CRC) tissue samples/patients that came from University Saint-Luc (Brussels)
@@ -301,6 +304,46 @@ masks_27 <- masks_28[images_27]
 gate_labels <- gate_labels[
   gate_labels$sample_id != "10123883-USL-VAR-TIS-01-IMC-02_005",
 ]
+```
+
+
+## gating via cymoviewer
+
+```{r, message=FALSE}
+image_ids <- names(images_27_obj)
+mask_ids <- names(masks_27)
+spe_ids <- unique(as.character(spe_27$sample_id))
+
+stopifnot(
+  identical(image_ids, mask_ids),
+  setequal(image_ids, spe_ids),
+  !anyDuplicated(image_ids)
+)
+
+cur_mcols <- S4Vectors::DataFrame(
+  image = image_ids,
+  sample_id = image_ids,
+  name = image_ids,
+  row.names = image_ids
+)
+
+mcols(images_27_obj) <- cur_mcols
+mcols(masks_27)      <- cur_mcols
+
+
+identical(mcols(images_27_obj), mcols(masks_27))
+identical(mcols(images_27_obj)$sample_id, names(masks_27))
+setequal(
+  mcols(images_27_obj)$sample_id,
+  unique(as.character(spe_27$sample_id))
+)
+```
+
+```{r}
+if (interactive()) {
+  cytomapperShiny(object = spe_27, mask = masks_27, image = images_27_obj,
+                  cell_id = "ObjectNumber", img_id = "sample_id")
+}
 ```
 
 
@@ -1733,13 +1776,25 @@ colnames(test_prob) <- label_mapping
 
 ```{r}
 test_pred <- factor(
-  label_mapping[max.col(test_prob)],
+  label_mapping[max.col(test_prob, ties.method = "first")],
   levels = label_mapping
 )
 
+test_idx <- match(
+  rownames(test_prob),
+  colnames(test_sce)
+)
+
+stopifnot(!anyNA(test_idx))
+
 test_true <- factor(
-  test_sce$cell_labels,
+  test_sce$cell_labels[test_idx],
   levels = label_mapping
+)
+
+stopifnot(
+  length(test_pred) == length(test_true),
+  !anyNA(test_true)
 )
 
 cm_test <- caret::confusionMatrix(
@@ -1808,8 +1863,6 @@ ggplot(test_perf) +
   ylab("Sensitivity (TPR)") +
   xlab("1 - Specificity (FPR)")
 ```
-
-
 
 
 
