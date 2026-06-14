@@ -66,6 +66,9 @@ library(ggridges)
 
 
 ```{r read-spe}
+# =====================================================================
+# STEP 01 — Read images (steinbock outputs)
+# =====================================================================
 # NOTE: читаємо вихід steinbock і будуємо головний об'єкт SPE (SpatialExperiment):
 # рядки = маркери IMC, колонки = клітини. Також задаємо out_dir для збереження результатів.
 # NOTE: дані з intensities/, regionprops/, neighbors/, panel.csv, images.csv (вихід steinbock).
@@ -87,7 +90,12 @@ rownames(rowData(spe))
 # spillover
 
 ```{r read-compensated-tiff}
-# NOTE: читаємо TIFF-зрізи одиничних барвників (compensation slide) у окремий об'єкт sceTIFF —
+# =====================================================================
+# STEP 02 — Compensate (spillover correction)
+# =====================================================================
+# NOTE:
+# Spillover в IMC (Imaging Mass Cytometry) — це коли сигнал одного металу "протікає" в інший канал.
+# читаємо TIFF-зрізи одиничних барвників (compensation slide) у окремий об'єкт sceTIFF —
 # вони потрібні, щоб оцінити spillover-матрицю між каналами металів.
 # NOTE: дані з *_compensation/ (підтеки img/, та images.csv, panel.csv цієї теки).
 comp_path <- list.files(base_path, pattern = "compensation$", full.names = TRUE)
@@ -104,6 +112,9 @@ sceTIFF <- readSCEfromTIFF(
 
 sceTIFF$Panel <- basename(base_path)
 sceTIFF
+```
+```{r}
+#TODO: visualise ....
 ```
 
 # comp assay
@@ -152,6 +163,13 @@ isotope_list$Ar <- 80
 
 ```{r, fig.height=5, fig.width=5}
 # NOTE: візуалізуємо spillover-матрицю (теплова карта перетікання сигналу між каналами).
+# NOTE:Як читати графік?
+# Рядки = канал-джерело сигналу.
+
+# Стовпці = канал, куди сигнал "протікає".
+# Чим червоніше — тим сильніший spillover.
+# Число в клітинці = відсоток spillover.
+
 plotSpillmat(sceTIFF, isotope_list = isotope_list)
 ```
 
@@ -174,17 +192,66 @@ spe <- compCytof(
   overwrite = FALSE
 )
 
+# Keep an uncompensated copy for before/after spillover QC.
+# counts is still the raw steinbock signal at this point; build a matching
+# asinh exprs assay on the same cofactor so the two scatters are comparable.
+spe_uncomp <- spe
+assay(spe_uncomp, "exprs") <- asinh(assay(spe_uncomp, "counts") / compensated_exprs_cofactor)
+
 assay(spe, "counts") <- assay(spe, "compcounts")
 assay(spe, "exprs") <- assay(spe, "compexprs")
 
 assay(spe, "compcounts") <- NULL
 assay(spe, "compexprs") <- NULL
-
 # already with comp assay
 spe
-
-saveRDS(spe, file.path(base_path, "ROut", "spe.rds"))
+# TODO: check  ROut -> Rout
+# saveRDS(spe, file.path(base_path, "ROut", "spe.rds"))
+saveRDS(spe, file.path(base_path, "Rout", "spe.rds"))
 ```
+
+
+
+```{r, fig.height=5, fig.width=5}
+# ADDED: but need to think more
+# NOTE: QC компенсації — пара каналів з найсильнішим spillover, до vs після компенсації.
+# Restrict to channels present in spe, find the strongest spillover pair, map to markers.
+valid_ch <- intersect(rownames(sm), rowData(spe)$channel_name)
+sm_sub   <- sm[valid_ch, valid_ch]
+diag(sm_sub) <- 0
+
+ij      <- which(sm_sub == max(sm_sub, na.rm = TRUE), arr.ind = TRUE)[1, ]
+src_ch  <- rownames(sm_sub)[ij[1]]   # source channel (bleeds out)
+tgt_ch  <- colnames(sm_sub)[ij[2]]   # target channel (receives bleed)
+
+ch2marker  <- setNames(rownames(spe), rowData(spe)$channel_name)
+src_marker <- ch2marker[[src_ch]]
+tgt_marker <- ch2marker[[tgt_ch]]
+
+p_before <- dittoSeq::dittoScatterPlot(
+  spe_uncomp, x.var = src_marker, y.var = tgt_marker,
+  assay.x = "exprs", assay.y = "exprs"
+) + ggtitle(paste0("Before: ", src_marker, " vs ", tgt_marker))
+
+p_after <- dittoSeq::dittoScatterPlot(
+  spe, x.var = src_marker, y.var = tgt_marker,
+  assay.x = "exprs", assay.y = "exprs"
+) + ggtitle("After compensation")
+
+p_before + p_after   # patchwork (already loaded)
+```
+
+
+```{r, fig.height=5, fig.width=5}
+# NOTE: візуалізуємо spillover-матрицю (теплова карта перетікання сигналу між каналами). - AFTER
+# TODO: check if visualisation is correct taken
+# NOTE: seems we don't have some significant  difference after
+ 
+
+plotSpillmat(sceTIFF, isotope_list = isotope_list)
+```
+
+
 Now we rewrote the assays in our spe to compensated
 
 
@@ -196,10 +263,15 @@ USL - the group of colorectal cancer (CRC) tissue samples/patients that came fro
 
 
 ```{r}
+# =====================================================================
+# STEP 04 — Label (manual gates)
+# =====================================================================
+# TODO: probably we can generate more gates
 # NOTE: читаємо ручні гейти (.rds), нормалізуємо назви міток (прибираємо суфікси _NN,
 # Cd4->CD4, MDSC_->MDSC, Cd8->CD8) і матчимо до клітин SPE через cell_id = sample_id_ObjectNumber.
 # NOTE: дані з gates/*.rds (ручне гейтування, експорт з cytomapperShiny).
-spe <- readRDS(file.path(base_path, "ROut", "spe.rds"))
+# spe <- readRDS(file.path(base_path, "ROut", "spe.rds"))
+spe <- readRDS(file.path(base_path, "Rout", "spe.rds"))
 
 gates <- list.files(
   file.path(base_path, "gates"),
@@ -248,6 +320,9 @@ nrow(gate_labels)
 # img, masks
 
 ```{r}
+# =====================================================================
+# STEP 03 — Segment (cells + masks)
+# =====================================================================
 # NOTE: відбираємо лише гейтовані клітини, що є в SPE, визначаємо 28 гейтованих знімків
 # і завантажуємо для них багатоканальні зображення та маски сегментації.
 # NOTE: дані з img/ (зображення) і masks/ (маски сегментації).
@@ -324,6 +399,7 @@ dittoHeatmap(
 delete 1 blank image from analysis
 
 ```{r}
+# NOTE: data clean
 # NOTE: прибираємо 1 порожній знімок з аналізу (28 -> 27 знімків) у SPE, зображеннях, масках і гейтах.
 spe_27 <- spe_28[
   ,
@@ -887,6 +963,9 @@ and `Fold5` was used as the held-out test set.
 Within the training set another 5-fold grouped cross-validation for XGBoost parameter tuning was applied
 
 ```{r prepare-data, message = FALSE, eval=TRUE}
+# =====================================================================
+# STEP 05 — Vectorize (cell × marker matrix)
+# =====================================================================
 # NOTE: готуємо дані для XGBoost — будуємо матриці ознак X (клітини в рядках, маркери в стовпцях,
 # без DNA/Histone, тому транспонуємо), цілі y (0-based), label_mapping (число<->тип),
 # інверсно-частотні ваги класів (з пониженням undefined та Igg) і об'єкти xgb.DMatrix.
@@ -1018,6 +1097,9 @@ ggplot(coldat |> dplyr::filter(label == "mregDC"),
 All heavy calculations are here
 
 ```{r train-model-cv, message = FALSE, eval = TRUE}
+# =====================================================================
+# STEP 06 — Train (grouped XGBoost)
+# =====================================================================
 # NOTE: НАЙВАЖЧІ обчислення — grid-search крос-валідація XGBoost. Створюємо згруповані за
 # знімками фолди (groupKFold, щоб клітини одного знімка не текли між train/valid), перебираємо
 # сітку гіперпараметрів (12 комбінацій) через xgb.cv з early stopping і зберігаємо найкращий
