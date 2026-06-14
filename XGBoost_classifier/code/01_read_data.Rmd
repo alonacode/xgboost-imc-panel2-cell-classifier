@@ -7,20 +7,37 @@ link to presentation
 https://docs.google.com/presentation/d/1j092IUsKge5XvswE18HGZPmz4NGRUtOXNunP9SOr3i0/edit?usp=sharing
 
 ```{r setup, include=FALSE}
+# NOTE: глобальні налаштування knitr — показуємо код (echo), ховаємо повідомлення/попередження.
 knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
 ```
 
 
 ```{r shell}
+# NOTE: що тут трапляється — команди steinbock CLI (запускаються в терміналі
+# ДО будь-якого R), які з вихідних IMC-знімків генерують усі вхідні теки для аналізу.
 # steinbock preprocess imc images --hpf 50
 # steinbock segment deepcell --minmax
 # steinbock measure intensities
 # steinbock measure regionprops
 # steinbock measure neighbors --type centroids --dmax 15
+
+# NOTE: звідки беруться дані (всі теки лежать у base_path = Panel_2_10/):
+#   raw/          — вихідні IMC-знімки (.mcd/.txt) з мас-цитометра (вхід для steinbock)
+#   img/          — багатоканальні TIFF, з `steinbock preprocess imc images --hpf 50` з raw/
+#   masks/        — маски сегментації клітин, з `steinbock segment deepcell --minmax`
+#   intensities/  — середні інтенсивності маркерів на клітину, з `steinbock measure intensities`
+#   regionprops/  — морфометрія клітин (площа, форма…), з `steinbock measure regionprops`
+#   neighbors/    — граф сусідства клітин, з `steinbock measure neighbors --type centroids --dmax 15`
+#   panel.csv, images.csv — панель з 44 маркерів і метадані знімків (надаються вручну)
+#   gates/*.rds   — ручне гейтування (мітки типів клітин), експорт з cytomapperShiny - Q: do we need to add more gates?
+#   *_compensation/ — TIFF-зрізи одиничних барвників для оцінки spillover (CATALYST)
+#   ROut/         — вихід R: збережений spe.rds, модель тощо
 ```
 
 
 ```{r load-libraries, message=FALSE}
+# NOTE: підключаємо всі бібліотеки Bioconductor/CRAN, потрібні для пайплайну
+# (робота з SPE, компенсація CATALYST, гейти cytomapper, навчання XGBoost, графіки).
 library(SingleCellExperiment)
 library(caret)
 library(xgboost)
@@ -49,12 +66,13 @@ library(ggridges)
 
 
 ```{r read-spe}
-base_path <- file.path(
-  path.expand("~"),
-  "Desktop",
-  "XGBoost_classifier",
-  "Panel_2_10"
-)
+# NOTE: читаємо вихід steinbock і будуємо головний об'єкт SPE (SpatialExperiment):
+# рядки = маркери IMC, колонки = клітини. Також задаємо out_dir для збереження результатів.
+# NOTE: дані з intensities/, regionprops/, neighbors/, panel.csv, images.csv (вихід steinbock).
+# NOTE: base_path має вказувати на реальну теку Panel_2_10 з даними steinbock.
+#       Зараз стоїть ~/Desktop/...; за потреби заміни на фактичний шлях до даних.
+
+base_path <- "/Users/svitlanamoiseyenko/Repos/genomic/xgboost-imc-panel2-cell-classifier/XGBoost_classifier/Panel_2_10"
 
 raw_exprs_cofactor <- 5
 
@@ -69,6 +87,9 @@ rownames(rowData(spe))
 # spillover
 
 ```{r read-compensated-tiff}
+# NOTE: читаємо TIFF-зрізи одиничних барвників (compensation slide) у окремий об'єкт sceTIFF —
+# вони потрібні, щоб оцінити spillover-матрицю між каналами металів.
+# NOTE: дані з *_compensation/ (підтеки img/, та images.csv, panel.csv цієї теки).
 comp_path <- list.files(base_path, pattern = "compensation$", full.names = TRUE)
 
 img_path <- file.path(comp_path, "img")
@@ -88,6 +109,8 @@ sceTIFF
 # comp assay
 
 ```{r process-compensated-sce}
+# NOTE: CATALYST-обробка compensation-зрізів: asinh-трансформація, дебаркодинг пікселів
+# (assignPrelim/estCutoffs/applyCutoffs), фільтр пікселів і обчислення spillover-матриці.
 compensation_pixel_exprs_cofactor <- 5
 compensated_exprs_cofactor <- 1
 
@@ -117,6 +140,8 @@ sceTIFF
 ```
 
 ```{r add-Ar}
+# NOTE: правимо першу назву каналу в spillover-матриці на "Ar80Di" і додаємо аргон (Ar=80)
+# до списку ізотопів, щоб канал коректно розпізнавався далі.
 spillover_matrix <- metadata(sceTIFF)$spillover_matrix
 colnames(spillover_matrix)[1] <- "Ar80Di"
 metadata(sceTIFF)$spillover_matrix <- spillover_matrix
@@ -126,10 +151,13 @@ isotope_list$Ar <- 80
 ```
 
 ```{r, fig.height=5, fig.width=5}
-plotSpillmat(sceTIFF, isotope_list = isotope_list) 
+# NOTE: візуалізуємо spillover-матрицю (теплова карта перетікання сигналу між каналами).
+plotSpillmat(sceTIFF, isotope_list = isotope_list)
 ```
 
 ```{r}
+# NOTE: застосовуємо spillover-компенсацію до головного SPE через compCytof():
+# перезаписуємо assay-и counts/exprs компенсованими значеннями і зберігаємо spe.rds у ROut/.
 sm <- metadata(sceTIFF)$spillover_matrix
 colnames(sm)[1] <- "Ar80Di"
 
@@ -168,6 +196,9 @@ USL - the group of colorectal cancer (CRC) tissue samples/patients that came fro
 
 
 ```{r}
+# NOTE: читаємо ручні гейти (.rds), нормалізуємо назви міток (прибираємо суфікси _NN,
+# Cd4->CD4, MDSC_->MDSC, Cd8->CD8) і матчимо до клітин SPE через cell_id = sample_id_ObjectNumber.
+# NOTE: дані з gates/*.rds (ручне гейтування, експорт з cytomapperShiny).
 spe <- readRDS(file.path(base_path, "ROut", "spe.rds"))
 
 gates <- list.files(
@@ -217,6 +248,9 @@ nrow(gate_labels)
 # img, masks
 
 ```{r}
+# NOTE: відбираємо лише гейтовані клітини, що є в SPE, визначаємо 28 гейтованих знімків
+# і завантажуємо для них багатоканальні зображення та маски сегментації.
+# NOTE: дані з img/ (зображення) і masks/ (маски сегментації).
 matched_gate_labels <- gate_labels[
   gate_labels$cell_id %in% colnames(spe),
 ]
@@ -257,7 +291,9 @@ images_28
 # Img QC
 
 ```{r heatmap, fig.height=10, fig.width=10}
-image_mean <- aggregateAcrossCells(spe_28, 
+# NOTE: QC на рівні знімків — рахуємо середню експресію маркерів по кожному знімку
+# і малюємо теплову карту, щоб виявити порожні/аномальні зображення.
+image_mean <- aggregateAcrossCells(spe_28,
                                    ids = spe_28$sample_id, 
                                    statistics="mean",
                                    use.assay.type = "counts")
@@ -288,6 +324,7 @@ dittoHeatmap(
 delete 1 blank image from analysis
 
 ```{r}
+# NOTE: прибираємо 1 порожній знімок з аналізу (28 -> 27 знімків) у SPE, зображеннях, масках і гейтах.
 spe_27 <- spe_28[
   ,
   spe_28$sample_id != "10123883-USL-VAR-TIS-01-IMC-02_005"
@@ -310,6 +347,8 @@ gate_labels <- gate_labels[
 ## gating via cymoviewer
 
 ```{r, message=FALSE}
+# NOTE: перевіряємо, що id зображень, масок і SPE повністю збігаються, і записуємо
+# узгоджені mcols (sample_id) для зображень та масок — підготовка до cytomapperShiny.
 image_ids <- names(images_27_obj)
 mask_ids <- names(masks_27)
 spe_ids <- unique(as.character(spe_27$sample_id))
@@ -340,6 +379,7 @@ setequal(
 ```
 
 ```{r}
+# NOTE: інтерактивне гейтування/перегляд клітин у cytomapperShiny (лише в інтерактивній сесії RStudio).
 if (interactive()) {
   cytomapperShiny(object = spe_27, mask = masks_27, image = images_27_obj,
                   cell_id = "ObjectNumber", img_id = "sample_id")
@@ -352,6 +392,8 @@ if (interactive()) {
 ## cells assigned to the same class multiple times
 
 ```{r}
+# NOTE: будуємо матрицю клітина x мітка і шукаємо клітини, яким одну й ту саму мітку
+# присвоїли кілька разів (same-label duplicates).
 cur_tab <- unclass(table( #make a mat no table class
   gate_labels$cell_id,
   gate_labels$cytomapper_CellLabel
@@ -371,6 +413,7 @@ if (length(same_label_duplicate_ids) > 0) {
 ## same label assigment
 
 ```{r}
+# NOTE: зводимо лічильники до 0/1 і знаходимо справжні doublets — клітини з кількома РІЗНИМИ мітками.
 cur_tab <- cur_tab_raw
 cur_tab[cur_tab > 1] <- 1
 
@@ -388,6 +431,8 @@ if (length(multi_label_doublet_ids) > 0) {
 # Consolidate labels
 
 ```{r}
+# NOTE: консолідуємо мітки: 1 мітка -> залишаємо; "Tumor + інше" -> залишаємо НЕ-Tumor мітку;
+# решту справжніх doublets -> видаляємо. Наприкінці зводимо статистику консолідації.
 #assign all cell_ids as doublets
 cur_labels <- rep("doublets", nrow(cur_tab))
 names(cur_labels) <- rownames(cur_tab) #cell IDs as names,
@@ -445,11 +490,13 @@ consolidation_stats
 ```
 
 ```{r}
+# NOTE: підрахунок клітин по кожній консолідованій мітці.
 table(cur_labels)
 ```
 
 
 ```{r}
+# NOTE: записуємо фінальні мітки у colData(spe_27)$cell_labels; клітини без гейту = "unlabelled".
 sce_labels <- rep("unlabelled", ncol(spe_27))
 names(sce_labels) <- colnames(spe_27)
 
@@ -476,6 +523,8 @@ table(spe_27$cell_labels)
 ## visualization
 
 ```{r}
+# NOTE: задаємо фіксовану палітру кольорів для кожного типу клітин і кладемо її в metadata(spe_27)
+# для подальших візуалізацій.
 cell_types <- c(
   B = "red3",
   BnT = "indianred4",
@@ -511,6 +560,8 @@ metadata(spe_27)$colour_vectors$cell_types <- cell_types
 ## QC
 
 ```{r}
+# NOTE: QC по мітках — беремо лише гейтовані клітини, рахуємо середню експресію
+# по (sample_id, cell_labels) і готуємо маркери (без DNA/Histone) для теплової карти.
 lab_sce <- spe_27[, !is.na(spe_27$cell_labels) & spe_27$cell_labels != "unlabelled"]
 
 # Aggregate mean expression per sample and cell label
@@ -539,6 +590,8 @@ cell_type_colors <- cell_type_colors[
 
 
 ```{r define-color-vector, fig.height=12, fig.width=10}
+# NOTE: теплова карта середньої експресії маркерів, згрупована за типами клітин (перевірка,
+# що мітки біологічно осмислені).
 dittoHeatmap(
   agr_sce[cur_markers, ],
   assay = "exprs",
@@ -558,6 +611,8 @@ dittoHeatmap(
 ## classifier rules
 
 ```{r}
+# NOTE: біологічні правила очистки перед навчанням: викидаємо Igg з IgG<1 та NK з CD7<0.5,
+# а mregDC з високим епітеліальним сигналом (panCK>0.5 або Ecad>0.8) перемічаємо на Tumor.
 lab_sce <- spe_27[, !is.na(spe_27$cell_labels) & spe_27$cell_labels != "unlabelled"]
 unlab_sce <- spe_27[, is.na(spe_27$cell_labels) | spe_27$cell_labels == "unlabelled"]
 
@@ -586,12 +641,14 @@ table(lab_sce$cell_labels)
 ## save lab_sce
 
 ```{r}
+# NOTE: таблиця кількості клітин кожного типу по кожному знімку (вхід для оптимізатора train/test поділу).
 dat <- as.data.frame(unclass(table(lab_sce$sample_id,lab_sce$cell_labels)))
 dat
 ```
 
 
 ```{r}
+# NOTE: скільки клітин загалом labelled vs unlabelled.
 table(
   label_status = ifelse(
     spe_27$cell_labels == "unlabelled",
@@ -606,6 +663,8 @@ table(
 ## split data into test & train sets
 
 ```{r}
+# NOTE: визначаємо функцію split_test_rows() — оптимізатор train/test поділу НА РІВНІ ЗНІМКІВ,
+# який цілиться у задані частки тест-набору окремо для частих і рідкісних типів клітин.
 # Stratified train/test row split for multi-label count data.
 #
 # Each row is a sample with non-negative counts of each cell type in the
@@ -730,6 +789,8 @@ split_test_rows <- function(counts,
 ## looking for a seed with the best distribution between train/test
 
 ```{r}
+# NOTE: запускаємо оптимізатор поділу з підвищеною вагою (rare_weight=20) для рідкісних типів
+# (B, BnT, MDSC, Igg, mregDC, NK), 1000 рестартів; res$summary показує досягнуті частки тесту.
 res <- split_test_rows(
   dat,
   default_test_frac = 0.20,
@@ -745,6 +806,8 @@ res$summary
 
 
 ```{r}
+# NOTE: друкуємо підсумок поділу (скільки знімків у тесті, значення цільової функції).
+# УВАГА: цей чанк використовує df і dt, яких не визначено вище — впаде, якщо їх не задати.
 cat(sprintf("Test rows: %d / %d (%.1f%%) | objective = %.5f | %.3fs\n",
             length(res$test_idx), nrow(df),
             100 * length(res$test_idx) / nrow(df),
@@ -753,12 +816,14 @@ print(res$summary)
 ```
 
 ```{r}
+# NOTE: фактично ділимо клітини на train_sce/test_sce за списком знімків з оптимізатора.
 test_sce <- lab_sce[, lab_sce$sample_id %in% res$test_rownames]
 train_sce <- lab_sce[, lab_sce$sample_id %in% res$train_rownames]
 ```
 
 
 ```{r}
+# NOTE: зводимо таблицю кількості клітин кожного типу окремо у train і test (перевірка балансу поділу).
 all_labels <- sort(unique(c(
   as.character(train_sce$cell_labels),
   as.character(test_sce$cell_labels)
@@ -790,6 +855,7 @@ split_stats
 ## rare cell types distribition between samples
 
 ```{r}
+# NOTE: окремо перевіряємо баланс рідкісних типів між train/test — і кількість клітин, і кількість знімків.
 rare_celltypes <- c("BnT", "Igg", "MDSC", "mregDC", "vCAF")
 
 rare_balance <- bind_rows(
@@ -821,6 +887,9 @@ and `Fold5` was used as the held-out test set.
 Within the training set another 5-fold grouped cross-validation for XGBoost parameter tuning was applied
 
 ```{r prepare-data, message = FALSE, eval=TRUE}
+# NOTE: готуємо дані для XGBoost — будуємо матриці ознак X (клітини в рядках, маркери в стовпцях,
+# без DNA/Histone, тому транспонуємо), цілі y (0-based), label_mapping (число<->тип),
+# інверсно-частотні ваги класів (з пониженням undefined та Igg) і об'єкти xgb.DMatrix.
 
 # Create unique cell identifiers so each cell can be traced back to its image
 # and object number after training, prediction, or error analysis.
@@ -924,6 +993,8 @@ Here it is clearly seen the upward rules for the specific markers work
 
 # TEMP / QC plots
 ```{r}
+# NOTE: QC-графіки, що правила очистки спрацювали — точкові діаграми для Igg (IgG vs DNA1)
+# та mregDC (Ecad vs panCK) з пороговими лініями.
 coldat <- as.data.frame(t(assay(train_sce, "exprs")))
 coldat$label <- train_sce$cell_labels
 
@@ -947,6 +1018,10 @@ ggplot(coldat |> dplyr::filter(label == "mregDC"),
 All heavy calculations are here
 
 ```{r train-model-cv, message = FALSE, eval = TRUE}
+# NOTE: НАЙВАЖЧІ обчислення — grid-search крос-валідація XGBoost. Створюємо згруповані за
+# знімками фолди (groupKFold, щоб клітини одного знімка не текли між train/valid), перебираємо
+# сітку гіперпараметрів (12 комбінацій) через xgb.cv з early stopping і зберігаємо найкращий
+# nrounds та mlogloss кожної моделі.
 
 # Make sure cells from the same image are not split across CV train/test folds.
 # groupKFold returns training indices, while xgb.cv expects validation indices,
@@ -1072,7 +1147,8 @@ cv_summary <- bind_rows(cv_summary)
 
 
 ```{r show-cv-summary}
-cv_summary |> 
+# NOTE: таблиця всіх комбінацій гіперпараметрів, відсортована за найкращим mlogloss (кращі зверху).
+cv_summary |>
   dplyr::arrange(best_mlogloss)
 ```
 
@@ -1080,6 +1156,8 @@ cv_summary |>
 ## cross-validation on the best param
 
 ```{r select-best-model, message = FALSE, eval = TRUE}
+# NOTE: обираємо комбінацію гіперпараметрів з найменшим CV-mlogloss і перезапускаємо CV лише для неї
+# з prediction=TRUE, щоб отримати out-of-fold прогнози для оцінки точності по типах клітин.
 # parameter combination with the lowest cross-validation log-loss
 best_params <- cv_summary |> 
   arrange(best_mlogloss) |> 
@@ -1140,6 +1218,8 @@ best_cv <- xgboost::xgb.cv(
 ## Check CV accuracy per cell type for the best model
 
 ```{r cv-accuracy-per-celltype, fig.height=8, fig.width=12}
+# NOTE: з out-of-fold ймовірностей беремо передбачений клас для кожної клітини (max.col),
+# повертаємо назви типів через label_mapping і будуємо confusion matrix проти істинних міток.
 # Extract out-of-fold predicted class probabilities from the best CV model.
 # Rows are cells, columns are cell-label classes.
 cv_prob <- best_cv$cv_predict
@@ -1209,6 +1289,8 @@ cm_cv <- caret::confusionMatrix(
 check where fibroblasts come from
 
 ```{r}
+# NOTE: діагностика — звідки беруться помилки (напр. Tumor, передбачені як Fibro): дивимось,
+# з яких знімків походять такі клітини.
 train_sce$predicted <- cv_pred
 table(train_sce$predicted,train_sce$cell_labels)
 table(train_sce$cell_labels)
@@ -1220,6 +1302,7 @@ table(cur_sce$predicted,cur_sce$cell_labels)
 
 
 ```{r cv-accuracy-per-celltype, fig.height=8, fig.width=12}
+# NOTE: загальні метрики CV-моделі (Accuracy, Kappa, no-information rate, p-value).
 cm_cv$overall
 # > cm_cv$overall
 #       Accuracy          Kappa  AccuracyLower  AccuracyUpper   AccuracyNull AccuracyPValue  McnemarPValue 
@@ -1237,6 +1320,7 @@ cm_cv$overall
 
 
 ```{r cv-accuracy-per-celltype, fig.height=8, fig.width=12}
+# NOTE: метрики окремо по кожному типу клітин — Sensitivity (TPR), Specificity, Pos Pred Value (precision).
 cm_cv$byClass
 # > cm_cv$byClass
 #                    Sensitivity Specificity Pos Pred Value
@@ -1256,7 +1340,8 @@ cm_cv$byClass
 ## FPR vs TPR on the best model param
 
 ```{r accuracy-per-cell-type, fig.height=8, fig.width=12}
-cv_perf <- data.frame(cm_cv$byClass) |> 
+# NOTE: графік TPR (Sensitivity) vs FPR (1-Specificity) по типах клітин; розмір точки = частота виявлення.
+cv_perf <- data.frame(cm_cv$byClass) |>
   mutate(
     class = sub("Class: ", "", rownames(cm_cv$byClass)),
     fpr = 1 - Specificity
@@ -1308,6 +1393,8 @@ ggplot(cv_perf) +
 extract evaluation dataframes
 
 ```{r extract-evaluation-dataframes}
+# NOTE: збираємо evaluation_log усіх CV-моделей у один «довгий» data.frame (train/test mlogloss
+# по ітераціях + параметри) для подальших таблиць і графіків.
 #models <- readRDS(file.path(base_path, "ROut_rds_all", "models.rds"))
 
 eval_data <- purrr::imap_dfr(models, function(model, model_id) {
@@ -1364,9 +1451,10 @@ eval_data
 
 
 ```{r best-model-summary}
-best_model_summary <- eval_data |> 
-  dplyr::filter(Type == "Test", is_best_iteration) |> 
-  arrange(best_mlogloss) |> 
+# NOTE: підсумкова таблиця моделей за тестовим mlogloss на їхній найкращій ітерації (кращі зверху).
+best_model_summary <- eval_data |>
+  dplyr::filter(Type == "Test", is_best_iteration) |>
+  arrange(best_mlogloss) |>
   select(
     model_id,
     max_depth,
@@ -1386,7 +1474,9 @@ best_model_summary
 ## visualize model evaluation
 
 ```{r model-evaluation}
-plot_heatmap_data <- eval_data |> 
+# NOTE: готуємо дані для теплової карти — мінімальний mlogloss по кожній комбінації гіперпараметрів
+# окремо для Train і Test.
+plot_heatmap_data <- eval_data |>
   dplyr::group_by(
     Type,
     eta,
@@ -1410,6 +1500,8 @@ plot_heatmap_data <- eval_data |>
 
 
 ```{r model-evaluation-2}
+# NOTE: функція make_heatmap() будує теплову карту mlogloss (рядки=комбінації параметрів,
+# стовпці=max_depth) з анотацією гіперпараметрів збоку; створюємо карти для Train і Test.
 make_heatmap <- function(plot_data, cur_type, show_param_annotation = TRUE) {
   
   df <- plot_data |> 
@@ -1511,6 +1603,7 @@ hm_test  <- make_heatmap(plot_heatmap_data, "Test", show_param_annotation = FALS
 
 
 ```{r model-evaluation-heatmap, fig.height=7.5, fig.width=12}
+# NOTE: показуємо теплові карти Train і Test поруч для порівняння (де перенавчання).
 hm_train + hm_test
 ```
 
@@ -1527,9 +1620,10 @@ indicating that a more conservative tree-splitting strategy is preferable for th
 
 
 ```{r model-evaluation-curves, fig.height=10, fig.width=12}
-best_model_summary <- eval_data |> 
-  dplyr::filter(Type == "Test", is_best_iteration) |> 
-  arrange(best_mlogloss) |> 
+# NOTE: визначаємо єдину найкращу модель (один рядок) за тестовим mlogloss.
+best_model_summary <- eval_data |>
+  dplyr::filter(Type == "Test", is_best_iteration) |>
+  arrange(best_mlogloss) |>
   dplyr::slice(1)
 
 best_model_summary
@@ -1537,6 +1631,7 @@ best_model_summary
 
 
 ```{r model-evaluation-curves, fig.height=10, fig.width=12}
+# NOTE: дістаємо назву параметрів, найкращу ітерацію і loss найкращої моделі для підпису на графіку.
 best_param_name <- best_model_summary$params
 best_iter <- best_model_summary$best_iteration
 best_loss <- best_model_summary$best_mlogloss
@@ -1544,6 +1639,8 @@ best_loss <- best_model_summary$best_mlogloss
 
 
 ```{r model-evaluation-curves, fig.height=10, fig.width=14}
+# NOTE: криві mlogloss по ітераціях бустингу для всіх моделей (фасет Train/Test x eta),
+# з позначкою обраної найкращої ітерації — видно перенавчання при глибших деревах.
 ggplot(
   eval_data,
   aes(
@@ -1612,6 +1709,8 @@ These classes should therefore be interpreted with caution in downstream predict
 # final classifier
 
 ```{r train-final-model, message = FALSE, eval = TRUE}
+# NOTE: навчаємо ФІНАЛЬНУ модель xgb.train на ВСІХ train-клітинах з найкращими параметрами та nrounds
+# (CV використовувалась лише для вибору параметрів). Саме ця модель іде на тест і прогнози.
 # Train the final XGBoost model on all training cells using the best CV parameters.
 # CV is only used to select parameters; this model is the one used for held-out
 # test evaluation and later prediction on unlabelled cells.
@@ -1626,6 +1725,7 @@ final_model <- xgboost::xgb.train(
 save final model via saveRDS
 
 ```{r train-final-model, message = FALSE, eval = TRUE}
+# NOTE: (закоментовано) збереження фінальної моделі у .rds; розкоментуй, щоб зберегти на диск.
 # saveRDS(
 #   final_model,
 #   file = file.path(base_path, "classifier_xgboost.rds")
@@ -1646,6 +1746,7 @@ nrounds = 108
 
 
 ```{r variable-importance, fig.height=8, fig.width=8}
+# NOTE: рахуємо важливість маркерів (xgb.importance за метрикою Gain) і беремо топ-20 для графіка.
 # final_model <- readRDS(
 #   file.path(base_path, "classifier_xgboost.rds")
 # )
@@ -1671,6 +1772,7 @@ var_imp_top <- var_imp |>
 
 
 ```{r variable-importance, fig.height=8, fig.width=8}
+# NOTE: стовпчиковий графік топ-20 найважливіших маркерів за Gain.
 ggplot(var_imp_top, aes(x = Gain, y = Feature)) +
   geom_col(fill = "steelblue") +
   theme_classic() +
@@ -1692,6 +1794,8 @@ This is a useful sanity check: the model is not relying on strange markers; it i
 # prepare test data
 
 ```{r prepare-test-data}
+# NOTE: готуємо held-out тестові дані — той самий набір маркерів, що і в навчанні, ті самі
+# рівні label_mapping; будуємо X_test і Xy_test (xgb.DMatrix) лише для гейтованих тест-клітин.
 test_sce$cell_id <- paste0(
   test_sce$sample_id,
   "_",
@@ -1734,6 +1838,8 @@ Xy_test
 ## visualize predicted results
 
 ```{r test-performance, fig.height=8, fig.width=12}
+# NOTE: прогноз фінальної моделі на тесті; xgb віддає плаский вектор ймовірностей, тому пробуємо
+# обидва способи reshape у матрицю (клітини x класи) і перевіряємо, де ймовірності сумуються в 1.
 raw_test_pred <- predict(final_model, newdata = Xy_test)
 
 # Try both possible reshaping directions
@@ -1756,6 +1862,8 @@ mean(abs(rowSums(test_prob_bycol) - 1))
 
 
 ```{r test-performance, fig.height=8, fig.width=12}
+# NOTE: обираємо правильно зорієнтовану матрицю ймовірностей, перевіряємо розміри та підписуємо
+# рядки (cell_id) і стовпці (типи клітин з label_mapping).
 if (
   mean(abs(rowSums(test_prob_byrow) - 1)) <
   mean(abs(rowSums(test_prob_bycol) - 1))
@@ -1775,6 +1883,8 @@ colnames(test_prob) <- label_mapping
 ```
 
 ```{r}
+# NOTE: з ймовірностей беремо передбачений клас (max.col), зіставляємо з істинними мітками тесту
+# і будуємо confusion matrix на held-out наборі.
 test_pred <- factor(
   label_mapping[max.col(test_prob, ties.method = "first")],
   levels = label_mapping
@@ -1805,17 +1915,21 @@ cm_test <- caret::confusionMatrix(
 
 
 ```{r}
+# NOTE: confusion matrix на тесті (рядки=передбачено, стовпці=істина).
 cm_test$table
 ```
 
 
 ```{r}
+# NOTE: загальні метрики моделі на held-out тесті (Accuracy, Kappa тощо).
 cm_test$overall
 ```
 
 
 
 ```{r test-performance, fig.height=8, fig.width=12}
+# NOTE: фінальний графік продуктивності на тесті — TPR (Sensitivity) vs FPR (1-Specificity)
+# по кожному типу клітин; розмір точки = частота виявлення.
 # Per-cell-type performance plot.
 test_perf <- data.frame(cm_test$byClass) |> 
   dplyr::mutate(
