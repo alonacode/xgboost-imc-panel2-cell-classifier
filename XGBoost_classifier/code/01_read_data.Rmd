@@ -456,6 +456,7 @@ setequal(
 
 ```{r}
 # NOTE: інтерактивне гейтування/перегляд клітин у cytomapperShiny (лише в інтерактивній сесії RStudio).
+# TODO: check maybe we need more
 if (interactive()) {
   cytomapperShiny(object = spe_27, mask = masks_27, image = images_27_obj,
                   cell_id = "ObjectNumber", img_id = "sample_id")
