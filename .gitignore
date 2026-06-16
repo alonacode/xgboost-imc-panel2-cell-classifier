@@ -11,3 +11,7 @@
 !XGBoost_classifier/Panel_2_10/*/.gitkeep
 
 .DS_Store
+.RDataTmp
+.Rhistory
+.RData
+.idea/
