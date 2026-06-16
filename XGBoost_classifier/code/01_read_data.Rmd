@@ -2060,6 +2060,55 @@ ggplot(test_perf) +
   xlab("1 - Specificity (FPR)")
 ```
 
+``` {r random-forest}
+library(randomForest)
+set.seed(42)
+
+message("Random Forest training started")
+rf_model <- randomForest(
+  x = X, 
+  y = y_true, 
+  ntree = 300, 
+  mtry = 8,
+  classwt = w_class, 
+  importance = TRUE
+)
+message("Random Forest training completed")
+rf_pred <- predict(rf_model, newdata = X_test)
+cm_rf <- caret::confusionMatrix(data = rf_pred, reference = y_test_true)
+
+message("General metrics for Random Forect")
+print(cm_rf$overall)
+
+message("Metrics for Random Forest by class")
+print(cm_rf$byClass[, c("Sensitivity", "Specificity", "Pos Pred Value")])
+
+
+consensus_df <- data.frame(
+  cell_id      = rownames(X_test),
+  XGBoost      = test_pred,     
+  RandomForest = rf_pred,        
+  True_Label   = y_test_true
+)
+
+consensus_df <- consensus_df |> 
+  mutate(
+    Consensus_Label = ifelse(XGBoost == RandomForest, 
+                             as.character(XGBoost), 
+                             "undefined")
+  )
+
+agree_percent <- mean(consensus_df$XGBoost == consensus_df$RandomForest) * 100
+cat(sprintf("\nConsensus percentage = %.2f%%\n", agree_percent))
+
+
+cat("\nDistribution of labels:\n")
+print(table(consensus_df$Consensus_Label))
+
+cat("\n Cross-table of disagreements (XGBoost vs Random Forest):\n")
+print(table(XGBoost = consensus_df$XGBoost, RandomForest = consensus_df$RandomForest))
+
+```
 
 
 
