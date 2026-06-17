@@ -723,6 +723,64 @@ dat <- as.data.frame(unclass(table(lab_sce$sample_id,lab_sce$cell_labels)))
 dat
 ```
 
+## gate quality / cleanliness QC
+
+```{r gate-quality-qc, eval=TRUE}
+# NOTE: QC ЯКОСТІ ГЕЙТІВ (не моделі) — оцінюємо, наскільки «чисті» ручні мітки ДО навчання.
+# Якість гейтів задає стелю точності моделі, тож дивимось на: (a) покриття типів,
+# (b) внутрішню узгодженість гейта в просторі маркерів, (c) явні зведення консолідації.
+# Перевикористовує lab_sce (гейтовані + очищені клітини) та assay "exprs".
+
+# (a) Coverage: скільки клітин і знімків дає кожен тип (видно недопредставлені типи,
+#     яким бракує прикладів для надійного навчання).
+coverage <- as.data.frame(colData(lab_sce)) |>
+  dplyr::group_by(cell_labels) |>
+  dplyr::summarise(
+    n_cells  = dplyr::n(),
+    n_images = dplyr::n_distinct(sample_id),
+    .groups  = "drop"
+  ) |>
+  dplyr::arrange(n_cells)
+coverage
+
+# (b) Nearest-centroid purity: для кожної клітини перевіряємо, чи її профіль маркерів
+#     найближчий до центроїда ВЛАСНОГО типу. Низька purity => шумний/брудний гейт.
+#     Data-driven, без ручних маркер-карт. Маркери без DNA/Histone, z-score по маркеру.
+qc_markers <- rownames(lab_sce)[
+  !grepl("DNA|Histone", rownames(lab_sce), ignore.case = TRUE)
+]
+
+z    <- scale(t(assay(lab_sce, "exprs")[qc_markers, ]))   # клітини x маркери (z-score)
+labs <- factor(lab_sce$cell_labels)
+
+# центроїд кожного типу в просторі маркерів (тип x маркер)
+centroids <- rowsum(z, labs) / as.numeric(table(labs))
+
+# відстань кожної клітини до кожного центроїда; найближчий = передбачений тип
+D <- sapply(seq_len(nrow(centroids)), function(k) {
+  sqrt(rowSums((z - matrix(centroids[k, ], nrow(z), ncol(z), byrow = TRUE))^2))
+})
+colnames(D) <- rownames(centroids)
+
+nearest <- colnames(D)[max.col(-D)]                       # мінімальна відстань
+purity  <- tapply(nearest == as.character(labs), labs, mean)
+
+gate_purity <- data.frame(
+  cell_label = names(purity),
+  purity     = round(as.numeric(purity), 3),
+  row.names  = NULL
+) |>
+  dplyr::left_join(coverage, by = c("cell_label" = "cell_labels")) |>
+  dplyr::arrange(purity)
+gate_purity
+
+# (c) Явний друк зведень консолідації, щоб числа були видимі поруч із QC.
+#     consolidation_stats і cur_labels обчислені вище у чанках консолідації.
+#     Розподіл між train/test додатково показують split_stats та rare_balance нижче.
+consolidation_stats
+table(cur_labels)
+```
+
 
 ```{r}
 # NOTE: скільки клітин загалом labelled vs unlabelled.
