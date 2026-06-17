@@ -1,0 +1,743 @@
+---
+title: "08_systematic_tuning"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Systematic improvement of the rare-cell XGBoost classifier
+
+This script does **not** retrain the production model. It is an **experiment harness** that runs a
+grid of *scenarios* (`split_cfg` × `clean_cfg` × `xgb_params`), evaluates each one with grouped
+cross-validation **and** the held-out test images, and writes **one CSV row per experiment** with
+the split parameters (6.1), the XGBoost parameters (6.2) and the evaluation metrics (6.3). The final
+section (6.4) selects the best model by **critical-class recall behind an accuracy/Kappa guardrail**.
+
+Goal: the dataset is dominated by Tumor (`AccuracyNull ≈ 0.74`), so plain accuracy hides failures on
+the rare/critical populations (MDSC, BnT, Igg, mregDC, PMN_MDSC, Neutrophil). Everything here is
+designed to surface and optimise those.
+
+## Prerequisites
+
+Run `01_read_data.Rmd` first **in the same R session**, at least through the cleaning chunk that
+builds `lab_sce` and `dat`. This harness re-uses `lab_sce` (the gated, biologically-cleaned cells).
+If you knit `08` in a fresh session, save the object once from `01`:
+
+```r
+# add to the end of 01 (optional), then it loads automatically below:
+# saveRDS(lab_sce, file.path(out_dir, "lab_sce.rds"))
+```
+
+```{r load-libraries}
+library(SingleCellExperiment)
+library(caret)
+library(xgboost)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(ggrepel)
+```
+
+```{r config-paths}
+base_path <- "/Users/svitlanamoiseyenko/Repos/genomic/xgboost-imc-panel2-cell-classifier/XGBoost_classifier/Panel_2_10"
+out_dir   <- file.path(base_path, "ROut")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+`%||%` <- function(a, b) if (is.null(a) || length(a) == 0) b else a
+```
+
+```{r load-lab-sce}
+# Re-use lab_sce from 01 (same session). Fall back to a saved copy if knitting fresh.
+if (!exists("lab_sce")) {
+  lab_rds <- file.path(out_dir, "lab_sce.rds")
+  if (file.exists(lab_rds)) {
+    lab_sce <- readRDS(lab_rds)
+  } else {
+    stop("`lab_sce` not found. Run 01_read_data.Rmd through the cleaning chunk first, ",
+         "or save it with saveRDS(lab_sce, file.path(out_dir, 'lab_sce.rds')).")
+  }
+}
+
+# Markers used as classifier features (DNA/Histone dropped, as in 01).
+marker_keep_global <- !grepl("DNA|Histone", rownames(lab_sce), ignore.case = TRUE)
+
+# Keep only confidently labelled cells.
+lab_sce_base <- lab_sce[, !is.na(lab_sce$cell_labels) & lab_sce$cell_labels != "unlabelled"]
+table(lab_sce_base$cell_labels)
+```
+
+---
+
+# Part A — 3-tier criticality system
+
+A single source of truth for cell-type priority. It drives both the train/test split (how much test
+data each class is guaranteed) and, optionally, the class weights.
+
+```{r criticality-tiers}
+cell_priority <- list(
+  critical     = c("MDSC", "BnT", "Igg", "mregDC", "PMN_MDSC", "Neutrophil"),
+  medium       = c("B", "NK", "DC", "MacCD209", "Treg", "vCAF"),
+  non_critical = c("Tumor", "CD4", "CD8", "Mac", "MacCD204", "Fibro",
+                   "SMA", "Vasculature", "undefined")
+)
+
+priority_of <- function(lab) {
+  dplyr::case_when(
+    lab %in% cell_priority$critical ~ "critical",
+    lab %in% cell_priority$medium   ~ "medium",
+    TRUE                            ~ "non_critical"
+  )
+}
+
+critical_classes <- cell_priority$critical
+```
+
+## Tier-aware image-level split
+
+Generalises `split_test_rows()` from `01`. Differences:
+
+* per-label test-fraction **target** and **weight** come from the label's tier (instead of a binary
+  rare/common flag);
+* a **minimum-test-count hinge penalty** pushes the optimiser to keep at least N cells of each
+  critical class in the test set — the whole point is to be able to *estimate* rare-class recall.
+
+The objective minimised over image subsets `S` (test side):
+
+```
+sum_l  w_l * (test_count_l / total_l - target_l)^2            # hit the per-tier test fraction
++ penalty_scale * sum_l  w_l * max(0, min_test_count_l - test_count_l)^2   # guarantee a floor in test
+```
+
+Optimisation is the same fast steepest-descent single-row-flip loop; with ~27 images each candidate
+flip's full objective (penalty included) is evaluated in one vectorised matrix op per step.
+
+```{r split-test-rows-tiered}
+split_test_rows_tiered <- function(counts,
+                                    cell_priority,
+                                    tier_test_frac = c(critical = 0.30, medium = 0.25, non_critical = 0.20),
+                                    tier_weight    = c(critical = 40,   medium = 10,   non_critical = 1),
+                                    min_test_count = c(critical = 8,    medium = 5,    non_critical = 0),
+                                    penalty_scale  = 1,
+                                    n_restarts     = 1000,
+                                    seed           = 42) {
+  set.seed(seed)
+
+  if (is.data.frame(counts)) counts <- as.matrix(counts)
+  storage.mode(counts) <- "double"
+
+  labels <- colnames(counts)
+  totals <- colSums(counts)
+  n      <- nrow(counts)
+
+  tier        <- priority_of(labels)
+  target_frac <- as.numeric(tier_test_frac[tier]); names(target_frac) <- labels
+  min_tc      <- as.numeric(min_test_count[tier]); names(min_tc)      <- labels
+
+  active     <- totals > 0
+  w          <- as.numeric(tier_weight[tier]) * active
+  inv_totals <- ifelse(active, 1 / pmax(totals, 1), 0)
+  min_tc     <- min_tc * active
+
+  score_of <- function(test_sum) {
+    err <- test_sum * inv_totals - target_frac
+    pen <- pmax(0, min_tc - test_sum)
+    sum(w * err * err) + penalty_scale * sum(w * pen * pen)
+  }
+
+  # Bias rows that contain higher-priority cells toward starting in the test set.
+  row_prob <- apply(counts, 1, function(r) {
+    pres <- r > 0
+    if (any(pres)) max(target_frac[pres]) else min(tier_test_frac)
+  })
+
+  best_score   <- Inf
+  best_in_test <- logical(n)
+
+  for (restart in seq_len(n_restarts)) {
+    in_test   <- runif(n) < row_prob
+    test_sum  <- colSums(counts[in_test, , drop = FALSE])
+    cur_score <- score_of(test_sum)
+
+    repeat {
+      sgn  <- 1 - 2 * in_test                                   # +1 add to test, -1 remove from test
+      # candidate test totals for flipping each single row: row i -> test_sum + sgn_i * counts[i, ]
+      cand <- sweep(sgn * counts, 2, test_sum, FUN = "+")
+      err  <- sweep(sweep(cand, 2, inv_totals, "*"), 2, target_frac, "-")
+      pen  <- pmax(sweep(-cand, 2, min_tc, "+"), 0)            # matrix first: keep dim for %*%
+      cand_score <- as.numeric((err * err) %*% w) +
+                    penalty_scale * as.numeric((pen * pen) %*% w)
+
+      best_i <- which.min(cand_score)
+      if (cand_score[best_i] >= cur_score - 1e-12) break        # local minimum
+
+      test_sum        <- test_sum + sgn[best_i] * counts[best_i, ]
+      in_test[best_i] <- !in_test[best_i]
+      cur_score       <- cand_score[best_i]
+    }
+
+    if (cur_score < best_score) {
+      best_score   <- cur_score
+      best_in_test <- in_test
+    }
+  }
+
+  test_sum    <- colSums(counts[best_in_test, , drop = FALSE])
+  train_sum   <- totals - test_sum
+  achieved    <- ifelse(active, test_sum * inv_totals, NA_real_)
+
+  summary_df <- data.frame(
+    label              = labels,
+    tier               = tier,
+    total              = totals,
+    test_count         = test_sum,
+    train_count        = train_sum,
+    target_test_frac   = target_frac,
+    achieved_test_frac = round(achieved, 3),
+    min_test_count     = min_tc,
+    meets_min          = test_sum >= min_tc,
+    row.names          = NULL
+  )
+
+  list(
+    test_idx       = which(best_in_test),
+    train_idx      = which(!best_in_test),
+    test_rownames  = rownames(counts)[best_in_test],
+    train_rownames = rownames(counts)[!best_in_test],
+    summary        = summary_df,
+    score          = best_score
+  )
+}
+```
+
+---
+
+# Part B — Data cleaning (toggleable rules)
+
+Existing `01` rules (low-IgG Igg dropped, low-CD7 NK dropped, mregDC→Tumor) are already baked into
+`lab_sce`. The functions below add **new** cleaning that can be switched on/off per scenario so we
+can measure its effect rather than assume it.
+
+```{r cleaning-helpers}
+# Robust area QC using steinbock regionprops `area` (segmentation-artifact removal).
+area_vector <- function(sce) {
+  cd <- colData(sce)
+  nm <- grep("^area$", colnames(cd), ignore.case = TRUE, value = TRUE)
+  if (length(nm) == 0) return(NULL)
+  as.numeric(cd[[nm[1]]])
+}
+
+# Per-class marker-profile outliers: cells whose profile barely correlates with their
+# class centroid (candidate mislabels). Used either for reporting or removal.
+profile_outlier_cor <- function(sce, marker_keep, min_class_n = 30) {
+  mat  <- as.matrix(assay(sce, "exprs")[marker_keep, , drop = FALSE])
+  labs <- as.character(sce$cell_labels)
+  cors <- rep(NA_real_, ncol(sce))
+  for (cl in unique(labs)) {
+    idx <- which(labs == cl)
+    if (length(idx) < min_class_n) next
+    centroid <- apply(mat[, idx, drop = FALSE], 1, median)
+    cors[idx] <- apply(mat[, idx, drop = FALSE], 2, function(v) {
+      suppressWarnings(stats::cor(v, centroid, method = "spearman"))
+    })
+  }
+  cors
+}
+
+apply_cleaning <- function(sce, cfg, marker_keep) {
+  if (isTRUE(cfg$drop_undefined)) {
+    sce <- sce[, sce$cell_labels != "undefined"]
+  }
+  if (isTRUE(cfg$area_qc)) {
+    area <- area_vector(sce)
+    if (!is.null(area)) {
+      la   <- log(pmax(area, 1))
+      keep <- la >= (median(la) - 3 * mad(la)) & la <= (median(la) + 3 * mad(la))
+      sce  <- sce[, keep]
+    }
+  }
+  if (isTRUE(cfg$outlier_remove)) {
+    cors <- profile_outlier_cor(sce, marker_keep)
+    keep <- is.na(cors) | cors >= (cfg$outlier_min_cor %||% 0)
+    sce  <- sce[, keep]
+  }
+  sce
+}
+```
+
+## Outlier report (report-only, no removal)
+
+Run this once to see candidate mislabels before deciding whether to enable `outlier_remove`.
+
+```{r outlier-report}
+cors0 <- profile_outlier_cor(lab_sce_base, marker_keep_global)
+outlier_report <- data.frame(
+  cell_label   = as.character(lab_sce_base$cell_labels),
+  sample_id    = as.character(lab_sce_base$sample_id),
+  centroid_cor = round(cors0, 3)
+) |>
+  dplyr::filter(!is.na(centroid_cor)) |>
+  dplyr::group_by(cell_label) |>
+  dplyr::summarise(
+    n                = dplyr::n(),
+    median_cor       = round(median(centroid_cor), 3),
+    frac_below_0.2   = round(mean(centroid_cor < 0.2), 3),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(median_cor)
+
+outlier_report
+```
+
+---
+
+# Part C/D — Helpers: feature matrix, folds, metrics, one experiment
+
+```{r make-xy}
+# Build XGBoost matrices + capped inverse-frequency weights. Factors out 01:966-1068.
+make_xy <- function(train_sce, test_sce, marker_keep,
+                    weight_cap       = c(0.2, 5),
+                    weight_overrides = NULL) {
+
+  train_sce$cell_id <- paste0(train_sce$sample_id, "_", train_sce$ObjectNumber)
+  test_sce$cell_id  <- paste0(test_sce$sample_id,  "_", test_sce$ObjectNumber)
+  colnames(train_sce) <- train_sce$cell_id
+  colnames(test_sce)  <- test_sce$cell_id
+
+  X       <- t(assay(train_sce, "exprs")[marker_keep, ])
+  y_true  <- factor(train_sce$cell_labels)
+  label_mapping <- levels(y_true)
+  y       <- as.integer(y_true) - 1
+  num_classes <- length(label_mapping)
+
+  test_keep <- !is.na(test_sce$cell_labels) &
+    test_sce$cell_labels != "unlabelled" &
+    test_sce$cell_labels %in% label_mapping
+  X_test      <- t(assay(test_sce, "exprs")[marker_keep, test_keep])
+  y_test_true <- factor(test_sce$cell_labels[test_keep], levels = label_mapping)
+  y_test      <- as.integer(y_test_true) - 1
+
+  stopifnot(identical(colnames(X), colnames(X_test)))
+
+  # Capped inverse-frequency class weights (no magic /10, /30 unless overridden).
+  freq    <- as.numeric(table(y_true) / length(y_true))
+  w_class <- 1 / freq
+  names(w_class) <- levels(y_true)
+  if (!is.null(weight_overrides)) {
+    for (nm in names(weight_overrides)) {
+      if (nm %in% names(w_class)) w_class[nm] <- w_class[nm] * weight_overrides[[nm]]
+    }
+  }
+  w_class <- w_class / mean(w_class)
+  w_class <- pmin(pmax(w_class, weight_cap[1]), weight_cap[2])
+  w       <- as.numeric(w_class[as.character(y_true)])
+  w       <- w / mean(w)
+
+  list(
+    Xy            = xgboost::xgb.DMatrix(data = X, label = y, weight = w),
+    Xy_test       = xgboost::xgb.DMatrix(data = X_test, label = y_test),
+    X = X, X_test = X_test,
+    y_true = y_true, y_test_true = y_test_true,
+    label_mapping = label_mapping, num_classes = num_classes
+  )
+}
+
+# Image-grouped CV folds (validation indices), as in 01:1112-1122.
+make_folds <- function(train_sce, k = 5) {
+  tr_idx  <- caret::groupKFold(factor(train_sce$sample_id), k = k)
+  all_idx <- seq_len(ncol(train_sce))
+  lapply(tr_idx, function(idx) setdiff(all_idx, idx))
+}
+
+# Reshape an xgb.cv / predict() softprob output into a cells × classes matrix.
+to_prob_matrix <- function(p, n, num_classes) {
+  if (is.list(p)) p <- do.call(rbind, p)
+  if (is.null(dim(p))) {
+    byrow_m <- matrix(p, ncol = num_classes, byrow = TRUE)
+    bycol_m <- matrix(p, ncol = num_classes, byrow = FALSE)
+    p <- if (mean(abs(rowSums(byrow_m) - 1)) <= mean(abs(rowSums(bycol_m) - 1)))
+      byrow_m else bycol_m
+  }
+  as.matrix(p)
+}
+```
+
+```{r metrics-helper}
+# Pull the exact cm$overall fields plus critical-class metrics. suffix = "cv" or "test".
+extract_metrics <- function(pred, truth, label_mapping, critical, suffix) {
+  cm <- caret::confusionMatrix(
+    data      = factor(as.character(pred),  levels = label_mapping),
+    reference = factor(as.character(truth), levels = label_mapping)
+  )
+  ov <- cm$overall
+  bc <- as.data.frame(cm$byClass)
+  rownames(bc) <- sub("Class: ", "", rownames(bc))
+  crit <- intersect(critical, rownames(bc))
+
+  out <- list(
+    Accuracy       = unname(ov["Accuracy"]),
+    Kappa          = unname(ov["Kappa"]),
+    AccuracyLower  = unname(ov["AccuracyLower"]),
+    AccuracyUpper  = unname(ov["AccuracyUpper"]),
+    AccuracyNull   = unname(ov["AccuracyNull"]),
+    AccuracyPValue = unname(ov["AccuracyPValue"]),
+    McnemarPValue  = unname(ov["McnemarPValue"]),
+    BalancedAccuracy_macro    = mean(bc[["Balanced Accuracy"]], na.rm = TRUE),
+    Sensitivity_critical_mean = mean(bc[crit, "Sensitivity"],     na.rm = TRUE),
+    Precision_critical_mean   = mean(bc[crit, "Pos Pred Value"],  na.rm = TRUE),
+    F1_critical_mean          = mean(bc[crit, "F1"],              na.rm = TRUE)
+  )
+  for (cl in critical) {
+    out[[paste0("Sens_", cl)]] <- if (cl %in% rownames(bc)) bc[cl, "Sensitivity"] else NA_real_
+  }
+  stats::setNames(out, paste0(names(out), "_", suffix))
+}
+```
+
+```{r run-experiment}
+# One scenario end-to-end -> single-row data.frame of params + metrics.
+run_experiment <- function(scenario, lab_sce_base, marker_keep, critical) {
+
+  # 1. clean
+  lab_clean <- apply_cleaning(lab_sce_base, scenario$clean_cfg, marker_keep)
+
+  # 2. tier-aware image-level split
+  dat <- as.data.frame(unclass(table(lab_clean$sample_id, lab_clean$cell_labels)))
+  sp  <- do.call(split_test_rows_tiered,
+                 c(list(counts = dat, cell_priority = cell_priority), scenario$split_cfg))
+
+  train_sce <- lab_clean[, lab_clean$sample_id %in% sp$train_rownames]
+  test_sce  <- lab_clean[, lab_clean$sample_id %in% sp$test_rownames]
+
+  # 3. feature matrices + weights
+  d <- make_xy(train_sce, test_sce, marker_keep,
+               weight_cap       = scenario$clean_cfg$weight_cap %||% c(0.2, 5),
+               weight_overrides = scenario$clean_cfg$weight_overrides)
+
+  # 4. CV folds + params
+  folds  <- make_folds(train_sce)
+  params <- c(
+    list(booster = "gbtree", objective = "multi:softprob", eval_metric = "mlogloss",
+         num_class = d$num_classes, tree_method = "hist",
+         nthread = max(1, parallel::detectCores() - 1)),
+    scenario$xgb
+  )
+
+  # 5. grouped CV with out-of-fold predictions
+  cv <- xgboost::xgb.cv(
+    params = params, data = d$Xy, folds = folds,
+    nrounds = scenario$nrounds %||% 500L,
+    early_stopping_rounds = 20, verbose = FALSE, prediction = TRUE
+  )
+  best_it <- which.min(cv$evaluation_log$test_mlogloss_mean)
+
+  cv_prob <- to_prob_matrix(cv$pred %||% cv$cv_predict, length(d$y_true), d$num_classes)
+  cv_pred <- d$label_mapping[max.col(cv_prob, ties.method = "first")]
+
+  # 6. final model on all training cells, evaluate on held-out test images
+  final_model <- xgboost::xgb.train(params = params, data = d$Xy,
+                                    nrounds = best_it, verbose = FALSE)
+  test_prob <- to_prob_matrix(predict(final_model, d$Xy_test),
+                              length(d$y_test_true), d$num_classes)
+  test_pred <- d$label_mapping[max.col(test_prob, ties.method = "first")]
+
+  # 7. metrics (cv + test)
+  m_cv   <- extract_metrics(cv_pred,   d$y_true,      d$label_mapping, critical, "cv")
+  m_test <- extract_metrics(test_pred, d$y_test_true, d$label_mapping, critical, "test")
+
+  # 8. assemble the row: 6.1 split params, 6.2 model params, 6.3 metrics
+  scfg <- scenario$split_cfg
+  split_params <- list(
+    split_id                   = scenario$split_id,
+    default_test_frac          = unname((scfg$tier_test_frac %||% c(non_critical = 0.20))["non_critical"]),
+    tier_test_frac_critical    = unname((scfg$tier_test_frac %||% c(critical = 0.30))["critical"]),
+    tier_test_frac_medium      = unname((scfg$tier_test_frac %||% c(medium = 0.25))["medium"]),
+    tier_test_frac_noncrit     = unname((scfg$tier_test_frac %||% c(non_critical = 0.20))["non_critical"]),
+    tier_weight_critical       = unname((scfg$tier_weight %||% c(critical = 40))["critical"]),
+    tier_weight_medium         = unname((scfg$tier_weight %||% c(medium = 10))["medium"]),
+    tier_weight_noncrit        = unname((scfg$tier_weight %||% c(non_critical = 1))["non_critical"]),
+    min_test_count_critical    = unname((scfg$min_test_count %||% c(critical = 8))["critical"]),
+    n_restarts                 = scfg$n_restarts %||% 1000,
+    seed                       = scfg$seed %||% 42,
+    n_train_cells              = ncol(train_sce),
+    n_test_cells               = ncol(test_sce),
+    n_test_images              = length(sp$test_rownames),
+    min_test_count_observed    = min(sp$summary$test_count)
+  )
+
+  model_params <- list(
+    model_id         = scenario$model_id,
+    max_depth        = params$max_depth,
+    eta              = params$eta,
+    subsample        = params$subsample,
+    colsample_bytree = params$colsample_bytree,
+    min_child_weight = params$min_child_weight,
+    gamma            = params$gamma %||% 0,
+    lambda           = params$lambda %||% 1,
+    alpha            = params$alpha %||% 0,
+    max_delta_step   = params$max_delta_step %||% 0,
+    nrounds_best     = best_it,
+    drop_undefined   = isTRUE(scenario$clean_cfg$drop_undefined),
+    weight_scheme    = scenario$clean_cfg$weight_scheme %||% "capped_invfreq"
+  )
+
+  as.data.frame(c(scenario_label = scenario$label,
+                  split_params, model_params, m_cv, m_test),
+                stringsAsFactors = FALSE, check.names = FALSE)
+}
+```
+
+---
+
+# Part D — Scenario grid (10 model combinations)
+
+Baseline `clean_cfg` mirrors `01` (so row #1 reproduces the current setup), and the shared
+tier-aware `split_cfg` guarantees a test floor for critical classes. The 10 rows vary **only the
+XGBoost parameters** so the model effect is isolated. Ablation scenarios (cleaning / split changes)
+are provided separately below.
+
+```{r scenario-grid}
+# Shared split + cleaning across the 10 model rows.
+split_cfg_main <- list(
+  tier_test_frac = c(critical = 0.30, medium = 0.25, non_critical = 0.20),
+  tier_weight    = c(critical = 40,   medium = 10,   non_critical = 1),
+  min_test_count = c(critical = 8,    medium = 5,    non_critical = 0),
+  n_restarts     = 1000,
+  seed           = 42
+)
+
+# Baseline cleaning = same as 01 (legacy weights, no new rules) for an honest baseline.
+clean_cfg_baseline <- list(
+  drop_undefined   = FALSE,
+  area_qc          = FALSE,
+  outlier_remove   = FALSE,
+  weight_cap       = c(0, Inf),
+  weight_overrides = list(undefined = 1 / 10, Igg = 1 / 30),
+  weight_scheme    = "legacy_invfreq"
+)
+
+# 10-combination XGBoost grid (Part C of the plan).
+xgb_grid <- tibble::tribble(
+  ~max_depth, ~eta,  ~min_child_weight, ~gamma, ~lambda, ~max_delta_step, ~subsample, ~colsample_bytree, ~note,
+  3,          0.10,  5,                 0,      1,       0,               0.8,        0.8,               "baseline (current best)",
+  3,          0.10,  5,                 0,      1,       1,               0.8,        0.8,               "+max_delta_step",
+  3,          0.05,  5,                 1,      1,       1,               0.8,        0.8,               "slower + gamma",
+  4,          0.05,  5,                 1,      5,       1,               0.8,        0.8,               "+L2",
+  4,          0.05,  1,                 0,      1,       1,               0.7,        0.6,               "more sampling",
+  3,          0.03,  5,                 1,      5,       2,               0.8,        0.8,               "strong reg",
+  4,          0.10,  1,                 0,      1,       0,               0.8,        0.8,               "flexible",
+  5,          0.05,  5,                 1,      5,       1,               0.8,        0.8,               "depth probe",
+  3,          0.05,  10,                1,      1,       1,               0.8,        0.6,               "conservative",
+  4,          0.05,  5,                 1,      5,       1,               0.7,        0.8,               "balanced reg"
+)
+
+scenarios <- lapply(seq_len(nrow(xgb_grid)), function(i) {
+  g <- xgb_grid[i, ]
+  list(
+    label     = paste0("model_", i, " (", g$note, ")"),
+    split_id  = "split_main",
+    model_id  = paste0("M", i),
+    split_cfg = split_cfg_main,
+    clean_cfg = clean_cfg_baseline,
+    nrounds   = 500L,
+    xgb = list(
+      max_depth        = g$max_depth,
+      eta              = g$eta,
+      min_child_weight = g$min_child_weight,
+      gamma            = g$gamma,
+      lambda           = g$lambda,
+      alpha            = 0,
+      max_delta_step   = g$max_delta_step,
+      subsample        = g$subsample,
+      colsample_bytree = g$colsample_bytree
+    )
+  )
+})
+
+length(scenarios)
+```
+
+## Run the grid (heavy compute)
+
+```{r run-grid, eval = TRUE}
+results <- purrr::map_dfr(scenarios, function(sc) {
+  message("Running ", sc$label)
+  run_experiment(sc, lab_sce_base, marker_keep_global, critical_classes)
+})
+
+results_path <- file.path(out_dir, "tuning_results.csv")
+write.csv(results, results_path, row.names = FALSE)
+message("Wrote ", nrow(results), " rows to ", results_path)
+
+results |>
+  dplyr::select(scenario_label, Accuracy_test, Kappa_test,
+                Sensitivity_critical_mean_test, F1_critical_mean_test) |>
+  dplyr::arrange(dplyr::desc(Sensitivity_critical_mean_test))
+```
+
+## Optional ablation scenarios (cleaning / split / weights)
+
+Run these to measure the impact of the new cleaning rules and weight scheme. They append rows to the
+same CSV so everything is comparable. Uses the best XGBoost params found above.
+
+```{r ablation-scenarios, eval = FALSE}
+best_xgb <- scenarios[[ which.max(results$Sensitivity_critical_mean_test) ]]$xgb
+
+ablations <- list(
+  list(label = "ablation_capped_weights", split_id = "split_main", model_id = "A1",
+       split_cfg = split_cfg_main, nrounds = 500L, xgb = best_xgb,
+       clean_cfg = list(drop_undefined = FALSE, area_qc = FALSE, outlier_remove = FALSE,
+                        weight_cap = c(0.2, 5), weight_overrides = NULL,
+                        weight_scheme = "capped_invfreq")),
+  list(label = "ablation_drop_undefined", split_id = "split_main", model_id = "A2",
+       split_cfg = split_cfg_main, nrounds = 500L, xgb = best_xgb,
+       clean_cfg = list(drop_undefined = TRUE, area_qc = FALSE, outlier_remove = FALSE,
+                        weight_cap = c(0.2, 5), weight_overrides = NULL,
+                        weight_scheme = "capped_invfreq")),
+  list(label = "ablation_area_qc", split_id = "split_main", model_id = "A3",
+       split_cfg = split_cfg_main, nrounds = 500L, xgb = best_xgb,
+       clean_cfg = list(drop_undefined = FALSE, area_qc = TRUE, outlier_remove = FALSE,
+                        weight_cap = c(0.2, 5), weight_overrides = NULL,
+                        weight_scheme = "capped_invfreq")),
+  list(label = "ablation_outlier_remove", split_id = "split_main", model_id = "A4",
+       split_cfg = split_cfg_main, nrounds = 500L, xgb = best_xgb,
+       clean_cfg = list(drop_undefined = FALSE, area_qc = FALSE, outlier_remove = TRUE,
+                        outlier_min_cor = 0.1, weight_cap = c(0.2, 5),
+                        weight_overrides = NULL, weight_scheme = "capped_invfreq"))
+)
+
+results_abl <- purrr::map_dfr(ablations, run_experiment,
+                              lab_sce_base = lab_sce_base,
+                              marker_keep  = marker_keep_global,
+                              critical     = critical_classes)
+
+results <- dplyr::bind_rows(results, results_abl)
+write.csv(results, results_path, row.names = FALSE)
+results_abl |>
+  dplyr::select(scenario_label, Accuracy_test, Kappa_test,
+                Sensitivity_critical_mean_test, F1_critical_mean_test)
+```
+
+---
+
+# Part F — Result analysis & model selection (6.4)
+
+Rule: **critical-class recall first, behind an accuracy/Kappa guardrail**. We never trade away
+overall quality — only models that stay near the current performance are eligible, and among those
+we pick the one that recovers the most rare cells.
+
+```{r select-best}
+acc_floor   <- 0.93   # guardrail: held-out test accuracy
+kappa_floor <- 0.85   # guardrail: held-out test Kappa
+
+eligible <- results |>
+  dplyr::filter(Accuracy_test >= acc_floor, Kappa_test >= kappa_floor)
+
+if (nrow(eligible) == 0) {
+  warning("No model passed the guardrail; relax acc_floor/kappa_floor or inspect results.")
+  eligible <- results
+}
+
+ranked <- eligible |>
+  dplyr::arrange(
+    dplyr::desc(Sensitivity_critical_mean_test),
+    dplyr::desc(F1_critical_mean_test),
+    dplyr::desc(Kappa_test)
+  )
+
+best_row <- ranked |> dplyr::slice(1)
+best_row |>
+  dplyr::select(scenario_label, model_id, Accuracy_test, Kappa_test,
+                Sensitivity_critical_mean_test, F1_critical_mean_test, nrounds_best)
+```
+
+## Delta vs the baseline (model #1)
+
+Which critical classes actually improved over the current setup.
+
+```{r delta-vs-baseline}
+baseline_row <- results |> dplyr::filter(model_id == "M1") |> dplyr::slice(1)
+
+sens_cols <- grep("^Sens_.*_test$", names(results), value = TRUE)
+delta <- data.frame(
+  class        = sub("^Sens_(.*)_test$", "\\1", sens_cols),
+  baseline     = round(as.numeric(baseline_row[sens_cols]), 3),
+  best         = round(as.numeric(best_row[sens_cols]), 3)
+)
+delta$delta <- round(delta$best - delta$baseline, 3)
+delta |> dplyr::arrange(delta)
+```
+
+## Per-cell-type TPR vs FPR for the winning model
+
+Re-fits the selected scenario once to draw the diagnostic plot (reuses the `01` style).
+
+```{r winner-plot, fig.height = 8, fig.width = 12}
+best_scenario <- c(scenarios, if (exists("ablations")) ablations)[[
+  which(vapply(c(scenarios, if (exists("ablations")) ablations),
+               function(s) s$label, character(1)) == best_row$scenario_label)
+]]
+
+lab_clean <- apply_cleaning(lab_sce_base, best_scenario$clean_cfg, marker_keep_global)
+dat       <- as.data.frame(unclass(table(lab_clean$sample_id, lab_clean$cell_labels)))
+sp        <- do.call(split_test_rows_tiered,
+                     c(list(counts = dat, cell_priority = cell_priority), best_scenario$split_cfg))
+train_sce <- lab_clean[, lab_clean$sample_id %in% sp$train_rownames]
+test_sce  <- lab_clean[, lab_clean$sample_id %in% sp$test_rownames]
+d         <- make_xy(train_sce, test_sce, marker_keep_global,
+                     weight_cap       = best_scenario$clean_cfg$weight_cap %||% c(0.2, 5),
+                     weight_overrides = best_scenario$clean_cfg$weight_overrides)
+params    <- c(list(booster = "gbtree", objective = "multi:softprob", eval_metric = "mlogloss",
+                    num_class = d$num_classes, tree_method = "hist",
+                    nthread = max(1, parallel::detectCores() - 1)), best_scenario$xgb)
+fm        <- xgboost::xgb.train(params = params, data = d$Xy,
+                                nrounds = best_row$nrounds_best, verbose = FALSE)
+test_prob <- to_prob_matrix(predict(fm, d$Xy_test), length(d$y_test_true), d$num_classes)
+test_pred <- factor(d$label_mapping[max.col(test_prob, ties.method = "first")],
+                    levels = d$label_mapping)
+cm_test   <- caret::confusionMatrix(test_pred, d$y_test_true)
+
+perf <- data.frame(cm_test$byClass) |>
+  dplyr::mutate(class = sub("Class: ", "", rownames(cm_test$byClass)),
+                fpr   = 1 - Specificity,
+                tier  = priority_of(class))
+
+ggplot(perf) +
+  geom_point(aes(x = fpr, y = Sensitivity, size = Detection.Rate, fill = tier),
+             shape = 21, color = "black", alpha = 0.9) +
+  ggrepel::geom_text_repel(aes(x = fpr, y = Sensitivity, label = class),
+                           size = 3, max.overlaps = Inf, min.segment.length = 0) +
+  scale_fill_manual(values = c(critical = "red3", medium = "orange2",
+                               non_critical = "grey60")) +
+  scale_size(range = c(1, 15)) +
+  theme_bw() +
+  labs(title = paste0("Held-out test performance: ", best_row$scenario_label),
+       y = "Sensitivity (TPR)", x = "1 - Specificity (FPR)")
+```
+
+## Conclusions
+
+```{r conclusions}
+cat(sprintf(
+"Selected model: %s
+  Held-out test : Accuracy = %.3f  Kappa = %.3f  (null = %.3f)
+  Critical recall (mean over %s): %.3f   |  baseline M1: %.3f
+  Guardrail     : Accuracy >= %.2f and Kappa >= %.2f  -> %d/%d models eligible
+
+Interpretation:
+  - Ranking by critical-class recall (not raw accuracy) targets the rare-cell mission,
+    because AccuracyNull (~%.2f) means a Tumor-only classifier already 'looks' good.
+  - Inspect the delta table: classes with delta <= 0 still need more gates or features.
+  - Any critical class with test sensitivity < 0.5 should be flagged 'interpret with caution'.
+",
+  best_row$scenario_label,
+  best_row$Accuracy_test, best_row$Kappa_test, best_row$AccuracyNull_test,
+  paste(critical_classes, collapse = ", "),
+  best_row$Sensitivity_critical_mean_test,
+  baseline_row$Sensitivity_critical_mean_test,
+  acc_floor, kappa_floor, nrow(eligible), nrow(results),
+  best_row$AccuracyNull_test
+))
+```
