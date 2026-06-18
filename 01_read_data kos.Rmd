@@ -1944,14 +1944,14 @@ ggplot(coldat_treg, aes(x = FOXP3, y = CD3, color = conflict)) +
 ggplot(
   coldat |> filter(XGBoost %in% c("BnT", "CD8") |
                    RandomForest %in% c("BnT", "CD8")),
-  aes(x = CD20, y = CD8a, color = paste0("XGB:", XGBoost, " RF:", RandomForest)) # <-- ТУТ ЗМІНЕНО НА CD8a
+  aes(x = CD20, y = CD8a, color = paste0("XGB:", XGBoost, " RF:", RandomForest)) # ТУТ ЗМІНЕНО НА CD8a
 ) +
   geom_point(alpha = 0.6, size = 1.5) +
   theme_bw() +
   labs(
     title = "BnT vs CD8 — CD20 як розрізняючий маркер",
     x = "CD20 (маркер B-клітин)",
-    y = "CD8a (маркер цитотоксичних T-клітин)", # <-- Оновили підпис осі
+    y = "CD8a (маркер цитотоксичних T-клітин)", # Оновили підпис осі
     color = "Передбачення"
   )
 ```
@@ -2039,5 +2039,238 @@ plotCells(
 
 ```
 
+``` {r LightGBM classifier}
+# LightGBM classifier
 
+library(lightgbm)
+
+# LightGBM приймає matrix або lgb.Dataset
+dtrain <- lgb.Dataset(
+  data  = X,
+  label = as.integer(y_true) - 1,   # 0-based
+  weight = w_class[as.character(y_true)]  # клас-ваги на рівні клітин
+)
+
+dtest <- lgb.Dataset(
+  data      = X_test,
+  label     = y_test,
+  reference = dtrain   # важливо: тест посилається на train для вирівнювання bin boundaries
+)
+
+# параметри
+lgb_params <- list(
+  objective        = "multiclass",
+  num_class        = num_classes,
+  num_leaves       = 31,
+  max_depth        = 4,
+  learning_rate    = 0.1,
+  feature_fraction = 0.8,
+  bagging_fraction = 0.8,
+  bagging_freq     = 5,
+  min_child_weight = 5,
+  lambda_l2        = 1.0,
+  lambda_l1        = 0.0,
+  verbose          = 50,
+  seed             = 42,
+  num_threads      = 0
+)
+
+# перестворити датасети (важливо після зміни параметрів)
+dtrain <- lgb.Dataset(
+  data   = X,
+  label  = as.integer(y_true) - 1,
+  weight = w_class[as.character(y_true)]
+)
+
+dtest <- lgb.Dataset(
+  data      = X_test,
+  label     = y_test,
+  reference = dtrain
+)
+
+lgb_model <- lgb.train(
+  params                = lgb_params,
+  data                  = dtrain,
+  nrounds               = 500,
+  valids                = list(test = dtest),
+  early_stopping_rounds = 20
+)
+#тренування з early stopping
+message("LightGBM training started")
+
+lgb_model <- lgb.train(
+  params                = lgb_params,
+  data                  = dtrain,
+  nrounds               = 500,
+  valids                = list(test = dtest),
+  early_stopping_rounds = 20
+)
+
+message(sprintf(
+  "LightGBM training completed. Best iteration: %d, best score: %.4f",
+  lgb_model$best_iter,
+  lgb_model$best_score
+))
+# передбачення
+# predict повертає матрицю n_cells × num_classes (ймовірності)
+lgb_prob_raw <- predict(
+  lgb_model,
+  X_test,
+  num_iteration = lgb_model$best_iter
+)
+# вручну reshape: вектор → матриця n_cells × num_classes
+lgb_prob_raw <- matrix(
+  predict(lgb_model, X_test, num_iteration = lgb_model$best_iter),
+  ncol  = num_classes,
+  byrow = FALSE
+)
+
+colnames(lgb_prob_raw) <- label_mapping
+rownames(lgb_prob_raw) <- colnames(test_sce)[test_eval_keep]
+
+# перевірка
+head(rowSums(lgb_prob_raw))  # має бути ~1.0
+
+lgb_pred <- factor(
+  label_mapping[max.col(lgb_prob_raw)],
+  levels = label_mapping
+)
+
+# оцінка 
+cm_lgb <- caret::confusionMatrix(
+  data      = lgb_pred,
+  reference = y_test_true
+)
+
+message("General metrics for LightGBM")
+print(cm_lgb$overall)
+
+message("Metrics for LightGBM by class")
+print(cm_lgb$byClass[, c("Sensitivity", "Specificity", "Pos Pred Value")])
+
+# Три-модельний консенсус: XGBoost + RF + LightGBM
+
+get_majority <- function(xgb, rf, lgb) {
+  votes  <- c(as.character(xgb), as.character(rf), as.character(lgb))
+  tbl    <- table(votes)
+  winner <- names(which.max(tbl))
+  if (max(tbl) < 2) return("undefined")
+  winner
+}
+
+consensus3_df <- data.frame(
+  cell_id      = rownames(X_test),
+  XGBoost      = test_pred,
+  RandomForest = rf_pred,
+  LightGBM     = lgb_pred,
+  True_Label   = y_test_true
+) |>
+  rowwise() |>
+  mutate(
+    Majority_Label = get_majority(XGBoost, RandomForest, LightGBM),
+    full_agreement = (XGBoost == RandomForest) &
+                     (RandomForest == LightGBM)
+  ) |>
+  ungroup()
+
+# статистика 
+cat(sprintf("\nFull agreement (all 3):      %.2f%%\n",
+    mean(consensus3_df$full_agreement) * 100))
+cat(sprintf("Majority agreement (>=2/3):  %.2f%%\n",
+    mean(consensus3_df$Majority_Label != "undefined") * 100))
+
+cat("\nMajority label distribution:\n")
+print(sort(table(consensus3_df$Majority_Label), decreasing = TRUE))
+
+cat(sprintf("\nMajority vote accuracy: %.4f\n",
+    mean(consensus3_df$Majority_Label ==
+         as.character(consensus3_df$True_Label), na.rm = TRUE)))
+cat(sprintf("XGBoost accuracy:       %.4f\n", cm_test$overall["Accuracy"]))
+cat(sprintf("Random Forest accuracy: %.4f\n", cm_rf$overall["Accuracy"]))
+cat(sprintf("LightGBM accuracy:      %.4f\n", cm_lgb$overall["Accuracy"]))
+
+
+test_sce$Majority_Label <- "unlabelled"
+test_sce$Majority_Label[test_eval_keep] <- consensus3_df$Majority_Label
+
+
+# Entropy-based uncertainty
+
+lgb_entropy <- -rowSums(lgb_prob_raw * log(lgb_prob_raw + 1e-10))
+entropy_threshold <- quantile(lgb_entropy, 0.90)
+
+consensus3_df$lgb_entropy  <- lgb_entropy
+consensus3_df$high_entropy <- lgb_entropy > entropy_threshold
+
+cat(sprintf(
+  "\nHigh-entropy cells (top 10%%): %d (%.1f%%)\n",
+  sum(consensus3_df$high_entropy),
+  mean(consensus3_df$high_entropy) * 100
+))
+
+consensus3_df |>
+  mutate(entropy_tier = ifelse(high_entropy, "high", "low")) |>
+  group_by(entropy_tier) |>
+  summarise(
+    full_agree_pct = mean(full_agreement) * 100,
+    n              = n(),
+    .groups        = "drop"
+  ) |>
+  print()
+
+
+lgb_varimp <- lgb.importance(lgb_model, percentage = TRUE)
+
+lgb_varimp_top <- lgb_varimp |>
+  slice_max(Gain, n = 20) |>
+  mutate(Feature = forcats::fct_reorder(Feature, Gain))
+
+ggplot(lgb_varimp_top, aes(x = Gain, y = Feature)) +
+  geom_col(fill = "#e67e22") +
+  theme_classic() +
+  labs(
+    title = "Top LightGBM Marker Importances",
+    x     = "Gain (%)",
+    y     = "Marker"
+  )
+
+# Порівняння важливості маркерів між трьома моделями
+
+varimp_compare <- var_imp |>                          # XGBoost
+  select(Feature, Gain) |>
+  rename(XGBoost = Gain) |>
+  full_join(
+    lgb_varimp |> select(Feature, Gain) |> rename(LightGBM = Gain),
+    by = "Feature"
+  ) |>
+  full_join(
+    data.frame(
+      Feature      = rownames(importance(rf_model)),
+      RandomForest = importance(rf_model)[, "MeanDecreaseGini"]
+    ),
+    by = "Feature"
+  ) |>
+  mutate(across(where(is.numeric), ~ replace_na(.x, 0))) |>
+  mutate(across(c(XGBoost, LightGBM, RandomForest), ~ .x / sum(.x))) |>  # нормалізація
+  pivot_longer(
+    cols      = c(XGBoost, LightGBM, RandomForest),
+    names_to  = "Model",
+    values_to = "Importance"
+  ) |>
+  group_by(Feature) |>
+  mutate(mean_imp = mean(Importance)) |>
+  ungroup() |>
+  slice_max(mean_imp, n = 60) |>   # топ-20 маркерів × 3 моделі
+  mutate(Feature = forcats::fct_reorder(Feature, mean_imp))
+
+ggplot(varimp_compare, aes(x = Importance, y = Feature, fill = Model)) +
+  geom_col(position = "dodge") +
+  scale_fill_brewer(palette = "Set2") +
+  theme_classic() +
+  labs(
+    title = "Marker importance across three models",
+    x     = "Normalized importance",
+    y     = "Marker"
+  )
+```
 
