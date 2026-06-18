@@ -1,0 +1,183 @@
+---
+title: "Random Forest & Consensus Gating Performance Report"
+output:
+  html_document:
+    toc: true       
+    toc_float: true      
+    theme: flatly
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, fig.width = 10, fig.height = 7)
+
+```
+
+## 1. Summary
+
+This report evaluates the classification performance of the **Random Forest (RF)** model, optimized via inverse-frequency class weights (`classwt`), and assesses its alignment with the baseline **XGBoost** model through a **Consensus Gating Pipeline**.
+
+---
+
+## 2. Model Evaluation Metrics
+
+### 2.1 Per-Class Sensitivity and Specificity Deep Dive
+
+This tabset breaks down how well the Random Forest model managed to distinguish each specific cell type, providing crucial insight into our rare cell optimization.
+
+::: {.tabset .nav-pills}
+
+#### Class Performance Table
+
+```{r class-metrics-table}
+library(knitr)
+library(kableExtra)
+
+rf_by_class <- as.data.frame(cm_rf$byClass[, c("Sensitivity", "Specificity", "Pos Pred Value", "Balanced Accuracy")])
+rownames(rf_by_class) <- sub("Class: ", "", rownames(rf_by_class))
+
+
+rf_by_class |> 
+  kable(caption = "Random Forest Performance Statistics by Biological Class") |> 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+
+```
+
+#### Sensitivity vs. Specificity Trade-off Plot
+
+```{r rf-performance-scatter}
+cv_perf_rf <- as.data.frame(cm_rf$byClass) |> 
+  dplyr::mutate(
+    class = sub("Class: ", "", rownames(cm_rf$byClass)),
+    fpr = 1 - Specificity
+  )
+
+ggplot(cv_perf_rf, aes(x = fpr, y = Sensitivity, fill = class)) +
+  geom_point(shape = 21, color = "black", alpha = 0.85, size = 4) + 
+  ggrepel::geom_text_repel(aes(label = class), size = 3.5, max.overlaps = Inf) +
+  scale_fill_manual(values = metadata(spe_27)$colour_vectors$cell_types, guide = "none") +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Random Forest Classifier: Sensitivity vs. False Positive Rate",
+    subtitle = "",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "Sensitivity (True Positive Rate)"
+  )
+
+```
+
+:::
+
+---
+
+## 3. Model Consensus & Disagreement Diagnostics
+
+By running a cross-validation consensus matrix, we evaluate the structural agreement between **XGBoost** and **Random Forest**.
+
+### 3.1 Consensus Metric
+
+```{r consensus-percentage, echo=FALSE}
+cat(sprintf("Overall Model Agreement Percentage = %.2f%%\n", agree_percent))
+
+```
+
+### 3.2 Matrix of Disagreements
+
+The cross-tabulation below reveals exactly where the two models clash on border cases (e.g., `Fibro` vs. `Tumor`).
+
+```{r disagreement-crosstab}
+disagreement_matrix <- table(XGBoost = consensus_df$XGBoost, RandomForest = consensus_df$RandomForest)
+
+disagreement_matrix |> 
+  kable(caption = "Cross-Table of Classifier Decisions (XGBoost Rows vs. Random Forest Columns)") |> 
+  kable_styling(bootstrap_options = c("striped", "condensed"), font_size = 11)
+
+```
+
+---
+
+## 4. Biomarker Expression Profiling (Conflict Plots)
+
+To understand *why* models disagree, we plot the conflicting cell arrays across real metal-channel marker intensities.
+
+::: {.tabset .nav-pills}
+
+#### Tumor vs. Fibro (panCK / SMA)
+
+```{r plot-tumor-fibro}
+# Scatter plot panCK vs SMA for conflicting cells
+ggplot(coldat_sub, aes(x = panCK, y = SMA, color = conflict)) +
+  geom_point(alpha = 0.7, size = 1.8) +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "Epithelial-Mesenchymal Transition Boundaries: panCK vs. SMA",
+    x = "panCK (Tumor Marker Expression)",
+    y = "SMA (Fibroblast/Stromal Expression)",
+    color = "Model Conflict Status"
+  )
+
+```
+
+#### T-Cell Subsets (FOXP3 / CD3)
+
+```{r plot-treg-cd4}
+# Scatter plot FOXP3 vs CD3
+ggplot(coldat_treg, aes(x = FOXP3, y = CD3, color = conflict)) +
+  geom_point(alpha = 0.7, size = 1.8) +
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "darkgrey") +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "Regulatory T-Cell Sorting: FOXP3 vs. CD3 Profiles",
+    x = "FOXP3 Expression (Treg Selection)",
+    y = "CD3 Expression (Pan-T Cell Lineage)",
+    color = "Model Conflict Status"
+  )
+
+```
+
+#### Lineage Sorting (CD20 / CD8a)
+
+```{r plot-bnt-cd8}
+ggplot(
+  coldat |> filter(XGBoost %in% c("BnT", "CD8") | RandomForest %in% c("BnT", "CD8")),
+  aes(x = CD20, y = CD8a, color = paste0("XGB:", XGBoost, " RF:", RandomForest))
+) +
+  geom_point(alpha = 0.7, size = 1.8) +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "B-Cell vs. Cytotoxic T-Cell Boundaries: CD20 vs. CD8a",
+    x = "CD20 (B-Cell Marker Expression)",
+    y = "CD8a (Cytotoxic T-Cell Expression)",
+    color = "Classification Discrepancy"
+  )
+
+```
+
+:::
+
+---
+
+## 5. Random Forest Feature Importance
+
+The chart below shows which phenotypic markers contributed most heavily to the Random Forest splits (Mean Decrease in Accuracy/Gini index).
+
+```{r rf-importance}
+# Extract and plot variable importance from randomForest
+rf_imp_df <- as.data.frame(importance(rf_model))
+rf_imp_df$Marker <- rownames(rf_imp_df)
+rf_imp_df <- rf_imp_df |> dplyr::arrange(desc(MeanDecreaseGini)) |> head(20)
+rf_imp_df$Marker <- forcats::fct_reorder(rf_imp_df$Marker, rf_imp_df$MeanDecreaseGini)
+
+ggplot(rf_imp_df, aes(x = MeanDecreaseGini, y = Marker)) +
+  geom_col(fill = "#008080") +
+  theme_classic(base_size = 12) +
+  labs(
+    title = "Top 20 Variable Importances (Gini Index)",
+    x = "Mean Decrease in Gini Impurity",
+    y = "Protein Target (Marker Name)"
+  )
+
+```
+
+
