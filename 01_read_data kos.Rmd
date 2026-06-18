@@ -2273,4 +2273,159 @@ ggplot(varimp_compare, aes(x = Importance, y = Feature, fill = Model)) +
     y     = "Marker"
   )
 ```
+``` {r LightGBM classifier}
+# 1. Кореляційна матриця між маркерами (на тренувальних даних)
+marker_cor <- cor(X, method = "spearman")
 
+# Знаходимо високо корельовані пари (r > 0.85)
+high_cor_pairs <- which(abs(marker_cor) > 0.85 & upper.tri(marker_cor), arr.ind = TRUE)
+
+high_cor_df <- data.frame(
+  Marker1 = rownames(marker_cor)[high_cor_pairs[, 1]],
+  Marker2 = colnames(marker_cor)[high_cor_pairs[, 2]],
+  r       = marker_cor[high_cor_pairs]
+) |>
+  arrange(desc(abs(r)))
+
+cat("Високо корельовані пари маркерів (|r| > 0.85):\n")
+print(high_cor_df)
+
+
+# 2. Консенсусна важливість між моделями
+# Нормалізуємо важливість кожної моделі до суми = 1
+xgb_imp <- var_imp |>
+  select(Feature, Gain) |>
+  mutate(XGBoost = Gain / sum(Gain)) |>
+  select(Feature, XGBoost)
+
+lgb_imp <- lgb_varimp |>
+  select(Feature, Gain) |>
+  mutate(LightGBM = Gain / sum(Gain)) |>
+  select(Feature, LightGBM)
+
+rf_imp <- data.frame(
+  Feature      = rownames(importance(rf_model)),
+  RandomForest = importance(rf_model)[, "MeanDecreaseGini"]
+) |>
+  mutate(RandomForest = RandomForest / sum(RandomForest))
+
+consensus_imp <- xgb_imp |>
+  full_join(lgb_imp,  by = "Feature") |>
+  full_join(rf_imp,   by = "Feature") |>
+  mutate(across(where(is.numeric), ~ replace_na(.x, 0))) |>
+  mutate(
+    mean_importance = (XGBoost + LightGBM + RandomForest) / 3,
+    min_importance  = pmin(XGBoost, LightGBM, RandomForest),  # найгірша модель
+    cv_importance   = apply(
+      cbind(XGBoost, LightGBM, RandomForest), 1,
+      function(x) sd(x) / mean(x)   # coefficient of variation — узгодженість між моделями
+    )
+  ) |>
+  arrange(desc(mean_importance))
+
+cat("\nТоп-20 маркерів за консенсусною важливістю:\n")
+print(head(consensus_imp, 20))
+
+# 3. Порогове відсікання: маркери з низькою важливістю в УСІХ моделях
+# Маркер вважається "слабким" якщо він нижче median в усіх трьох моделях
+median_xgb <- median(consensus_imp$XGBoost)
+median_lgb <- median(consensus_imp$LightGBM)
+median_rf  <- median(consensus_imp$RandomForest)
+
+weak_markers <- consensus_imp |>
+  filter(
+    XGBoost      < median_xgb,
+    LightGBM     < median_lgb,
+    RandomForest < median_rf
+  )
+
+cat(sprintf("\nМаркерів нижче медіани в усіх 3 моделях: %d з %d\n",
+    nrow(weak_markers), nrow(consensus_imp)))
+cat("Слабкі маркери:\n")
+print(weak_markers$Feature)
+
+# 4. Retrain з відібраними маркерами і порівняй accuracy
+strong_markers <- consensus_imp |>
+  filter(!(Feature %in% weak_markers$Feature)) |>
+  pull(Feature)
+
+cat(sprintf("\nЗалишається %d сильних маркерів\n", length(strong_markers)))
+
+X_reduced      <- X[, strong_markers]
+X_test_reduced <- X_test[, strong_markers]
+
+# Швидкий retrain XGBoost на відібраних маркерах
+Xy_reduced <- xgboost::xgb.DMatrix(
+  data  = X_reduced,
+  label = y         
+)
+
+model_reduced <- xgboost::xgb.train(
+  params  = params_best,
+  data    = Xy_reduced,
+  nrounds = best_nrounds,
+  verbose = FALSE
+)
+
+Xy_test_reduced <- xgboost::xgb.DMatrix(
+  data  = X_test_reduced,
+  label = y_test
+)
+
+pred_reduced_raw <- predict(model_reduced, Xy_test_reduced)
+pred_reduced_prob <- matrix(pred_reduced_raw, ncol = num_classes, byrow = TRUE)
+pred_reduced <- factor(
+  label_mapping[max.col(pred_reduced_prob)],
+  levels = label_mapping
+)
+
+cm_reduced <- caret::confusionMatrix(
+  data      = pred_reduced,
+  reference = y_test_true
+)
+
+cat("\n--- Порівняння accuracy ---\n")
+cat(sprintf("Повний набір маркерів (%d):    %.4f\n",
+    ncol(X), cm_test$overall["Accuracy"]))
+cat(sprintf("Відібрані маркери (%d):        %.4f\n",
+    length(strong_markers), cm_reduced$overall["Accuracy"]))
+
+
+# 5. Візуалізація консенсусної важливості з CV між моделями
+
+consensus_imp |>
+  slice_max(mean_importance, n = 25) |>
+  mutate(
+    Feature = forcats::fct_reorder(Feature, mean_importance),
+    consistency = case_when(
+      cv_importance < 0.3 ~ "high",    # моделі добре узгоджені
+      cv_importance < 0.6 ~ "medium",
+      TRUE                ~ "low"      # моделі розходяться
+    )
+  ) |>
+  ggplot(aes(x = mean_importance, y = Feature, fill = consistency)) +
+  geom_col() +
+  scale_fill_manual(
+    values = c("high" = "#2ecc71", "medium" = "#f39c12", "low" = "#e74c3c"),
+    name   = "Model agreement"
+  ) +
+  theme_classic() +
+  labs(
+    title    = "Consensus marker importance with inter-model agreement",
+    subtitle = "Green = all models agree, red = models disagree on this marker",
+    x        = "Mean normalized importance",
+    y        = "Marker"
+  ) 
+library(corrplot)
+
+corrplot(
+  marker_cor,
+  method  = "color",
+  type    = "upper",
+  tl.cex  = 0.7,
+  tl.col  = "black",
+  col     = colorRampPalette(c("#2166ac", "white", "#b2182b"))(200),
+  title   = "Marker correlation matrix",
+  mar     = c(0, 0, 1, 0)
+)
+```
