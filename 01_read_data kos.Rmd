@@ -304,6 +304,55 @@ gate_labels <- gate_labels[
   gate_labels$sample_id != "10123883-USL-VAR-TIS-01-IMC-02_005",
 ]
 ```
+```{r plotPixels-for-presentation, fig.height=8, fig.width=8}
+
+
+# 1. Обираємо один репрезентативний зразок для картинки
+target_sample_px <- names(images_27_obj)[1]
+# Якщо перший зразок не дуже показовий — поміняй індекс [1] на [2], [3] і т.д.
+# або підстав конкретну назву зразка з images_27, напр.:
+# target_sample_px <- images_27[3]
+
+cat("Зразок для картинки:", target_sample_px, "\n")
+
+# 2. Три канали, що добре ілюструють біологію тканини:
+#    panCK   — пухлинні (епітеліальні) клітини
+#    CD3     — Т-клітини (імунна інфільтрація)
+#    CD204   — макрофаги
+markers_to_plot <- c("panCK", "CD3", "CD204")
+
+# Перевірка, що всі маркери справді є в панелі
+stopifnot(all(markers_to_plot %in% channelNames(images_27_obj)))
+
+# 3. Малюємо композитне зображення (overlay) трьох каналів
+plotPixels(
+  image      = images_27_obj[target_sample_px],
+  mask       = masks_27[target_sample_px],
+  object     = spe_27[, spe_27$sample_id == target_sample_px],
+  img_id     = "sample_id",
+  cell_id    = "ObjectNumber",
+  colour_by  = markers_to_plot,
+  colour     = list(
+    panCK = c("black", "#33CC33"),   # зелений — пухлина
+    CD3   = c("black", "#FF3333"),   # червоний — Т-клітини
+    CD204 = c("black", "#3399FF")    # синій — макрофаги
+  ),
+  bcg = list(
+    panCK = c(0, 5, 1),   # (offset, scale, gamma) — підбери scale під свої дані
+    CD3   = c(0, 5, 1),
+    CD204 = c(0, 5, 1)
+  ),
+  outline_by         = "cell_labels",   # обводить клітини за анотованим типом (опційно)
+  display             = "single",
+  legend               = list(colour_by.title.cex = 1.2),
+  # 4. Зберігаємо одразу через cytomapper (НЕ через ggsave — plotPixels
+  #    повертає не ggplot, а растровий grid-об'єкт)
+  save_plot = list(
+    filename = file.path(out_dir, "plotPixels_panCK_CD3_CD204.png"),
+    scale    = 3
+  )
+)
+```
 
 
 ## consolidating labels
@@ -2272,6 +2321,7 @@ ggplot(varimp_compare, aes(x = Importance, y = Feature, fill = Model)) +
     x     = "Normalized importance",
     y     = "Marker"
   )
+
 ```
 ``` {r LightGBM classifier}
 # 1. Кореляційна матриця між маркерами (на тренувальних даних)
@@ -2428,4 +2478,109 @@ corrplot(
   title   = "Marker correlation matrix",
   mar     = c(0, 0, 1, 0)
 )
+```
+
+```{r cytomapper-spatial-plots, fig.height=10, fig.width=12}
+# 1. Завантажуємо багатоканальні картинки (шари білків) для відкладеного тесту
+# (Використовуємо регулярний вираз для пошуку файлів лише тих знімків, які є в тесті)
+test_images_pattern <- paste0("^", unique(test_sce$sample_id), "[.]tiff$", collapse = "|")
+
+test_images <- loadImages(file.path(base_path, "img"), pattern = test_images_pattern)
+channelNames(test_images) <- rownames(spe_27)
+
+# 2. Завантажуємо відповідні маски сегментації (контури клітин)
+test_masks <- loadImages(file.path(base_path, "masks"), pattern = test_images_pattern, as.is = TRUE)
+test_masks <- test_masks[names(test_images)] # Синхронізуємо порядок
+
+# Зв'язуємо метадані масок та картинок
+S4Vectors::mcols(test_images) <- S4Vectors::mcols(test_masks) <- S4Vectors::DataFrame(sample_id = names(test_images))
+
+# 3. Створюємо фірмову палітру кольорів для презентації результатів консенсусу
+cell_type_colors <- c(
+  "Tumor"       = "#FF3344",  # Яскравий неоново-червоний (пухлина)
+  "Fibro"       = "#33AAFF",  # Яскравий блакитний/циан (фібробласти строми)
+  "SMA"         = "#FF9933",  # Гарячий помаранчевий
+  "CD4"         = "#D470FF",  # Світло-пурпурний
+  "CD8"         = "#33FF77",  # Лаймовий зелений
+  "Treg"        = "#FF66CC",  # Рожевий
+  "B"           = "#A65628",  # Коричневий
+  "BnT"         = "#F781BF",  # Насичений рожевий
+  "DC"          = "#004225",  
+  "mregDC"      = "#00FFFF",  # Неонова аква
+  "Mac"         = "#E41A1C",  # Червоний
+  "MacCD204"    = "#FF00FF",  # Маджента
+  "MacCD209"    = "#990000",  # Бордовий
+  "MDSC"        = "#FFD700",  # Золотий
+  "PMN_MDSC"    = "#4DAF4A",  # Зелений трав'яний
+  "Neutrophil"  = "#984EA3",  # Фіолетовий
+  "NK"          = "#FFFF00",  # Чистий жовтий (наші реанімовані клітини)
+  "Vasculature" = "#377EB8",  # Синій судинний
+  "vCAF"        = "#FF7F00",  # Помаранчевий CAF
+  "undefined"   = "#FFFFFF",  # Чистий білий (зони суперечок моделей)
+  "unlabelled"  = "#444444" ,  # Темно-сірий
+  "Igg" = "#00CED1"
+
+)
+
+color_list <- list(Consensus_Label = cell_type_colors)
+
+# Переконуємося, що ID клітин у метаданих приведені до цілого числа (для збігу з масками)
+test_sce$ObjectNumber <- as.integer(test_sce$ObjectNumber)
+
+# 4. ВІЗУАЛІЗАЦІЯ КАРТИ КЛІТИННОГО РІВНЯ ДЛЯ ПЕРШОГО ЗНІМКА
+target_sample <- unique(test_sce$sample_id)[1]
+cat("Будуємо просторову карту для тестового зразка:", target_sample, "\n")
+# 1. Select your target image ID
+target_sample <- unique(test_sce$sample_id)[1]
+# 2. Extract ALL cells for this specific image from your main, full dataset (spe_27)
+# This includes cells that didn't have manual gates originally
+image_all_sce <- spe_27[, spe_27$sample_id == target_sample]
+# 3. Prepare the expression matrix for ALL cells on this image
+marker_keep <- !grepl("DNA|Histone", rownames(image_all_sce))
+X_image_all <- t(assay(image_all_sce, "exprs")[marker_keep, ])
+
+
+# 4. Use LightGBM to predict labels for EVERY cell
+lgb_pred_raw_all <- predict(
+  lgb_model,
+  X_image_all,
+  num_iteration = lgb_model$best_iter
+)
+
+# reshape вектор у матрицю n_cells × num_classes
+lgb_prob_all <- matrix(
+  lgb_pred_raw_all,
+  ncol  = num_classes,
+  byrow = FALSE
+)
+
+cat("Rows in lgb_prob_all:", nrow(lgb_prob_all), "\n")
+cat("Cells in image:", nrow(X_image_all), "\n")
+cat("Sum check (should be ~1):", mean(abs(rowSums(lgb_prob_all) - 1)), "\n")
+
+colnames(lgb_prob_all) <- label_mapping
+# беремо клас з найвищою ймовірністю
+all_cells_pred <- label_mapping[max.col(lgb_prob_all)]
+all_cells_pred[all_cells_pred == "NK"] <- "undefined"
+
+# 5. Save predictions into metadata column
+image_all_sce$Full_Predicted_Label <- all_cells_pred
+# 6. Technical check: Ensure cell IDs are integers for cytomapper compatibility
+image_all_sce$ObjectNumber <- as.integer(image_all_sce$ObjectNumber)
+
+color_list_full <- list(Full_Predicted_Label = cell_type_colors)
+
+# Plot the comprehensive map
+plotCells(
+  mask = test_masks[target_sample],
+  object = image_all_sce,                # NOW USING THE FULL IMAGE OBJECT
+  img_id = "sample_id",
+  cell_id = "ObjectNumber",
+  colour_by = "Full_Predicted_Label",    # NOW USING FULL PREDICTIONS
+  col = color_list_full,
+  missing_colour = "#1A1A1A",            # Background for unsegmented pixels
+  background_colour = "#000000",
+  thick = TRUE                           # Draws cell borders clearly
+)
+
 ```
