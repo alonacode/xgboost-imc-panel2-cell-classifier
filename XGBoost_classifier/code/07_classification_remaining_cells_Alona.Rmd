@@ -51,6 +51,9 @@ model <- readRDS(file.path(base_path, "classifier_xgboost.rds"))
 # mask_panels  <- list(Panel_2_09 = masks_09,  Panel_2_10 = masks_10,  Panel_2_12 = masks_12)
 
 # images_10 та masks_10 вже в памʼяті (58 елементів) — беремо тільки 30 нових образів
+images_10 <- cytomapper::loadImages(file.path(base_path, "img"),   pattern = "\\.tiff$")
+masks_10  <- cytomapper::loadImages(file.path(base_path, "masks"), pattern = "\\.tiff$", as.is = TRUE)
+channelNames(images_10) <- rownames(spe)
 new_sample_ids <- setdiff(unique(spe$sample_id), images_28)
 
 images_new <- images_10[names(images_10) %in% new_sample_ids]
@@ -61,6 +64,10 @@ mcols(images_new) <- mcols(masks_new) <-
 
 image_panels <- list(Panel_2_10 = images_new)
 mask_panels  <- list(Panel_2_10 = masks_new)
+cat("images_28:", length(images_28), "\n")
+cat("images_new:", length(images_new), "\n")
+cat("total spe img:", length(unique(spe$sample_id)), "\n")
+  
 ```
 
 ```{r}
@@ -517,7 +524,7 @@ plot_predicted_cells <- function(
 ```
 
 
-```{r plot-predicted-b-cells, fig.height=12, fig.width=18}
+```{r plot-predicted-b-cells, fig.height=20, fig.width=20}
 plot_predicted_cells(
   sce = unlab_sce,
   cell_type = "B",
@@ -528,11 +535,15 @@ plot_predicted_cells(
   ),
   normalize_images = TRUE,
   input_range = c(0, 0.2),
-  n_samples = 5
+  n_samples = 15
 )
 ```
 
-```{r, fig.height=10, fig.width=15}
+
+
+
+
+```{r, fig.height=20, fig.width=20}
 plot_predicted_cells(
   sce = unlab_sce,
   cell_type = "BnT",
@@ -543,11 +554,12 @@ plot_predicted_cells(
   ),
   normalize_images = TRUE,
   input_range = c(0, 0.2),
-  n_samples = 5
+  n_samples = 15
 )
+
 ```
 
-```{r, fig.height=10, fig.width=15}
+```{r, fig.height=20, fig.width=20}
 plot_predicted_cells(
   sce = unlab_sce,
   cell_type = "Tumor",
@@ -558,7 +570,7 @@ plot_predicted_cells(
   ),
   normalize_images = TRUE,
   input_range = c(0, 0.2),
-  n_samples = 5
+  n_samples = 15
 )
 ```
 
