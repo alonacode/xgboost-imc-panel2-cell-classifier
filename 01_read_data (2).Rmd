@@ -1,0 +1,4136 @@
+---
+title: "Machine Learning Pipeline for Imaging Mass Cytometry Data Processing and Automated
+  Single-Cell Annotation in Spatial Proteomics"
+author: "Yuliia Babkova"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+link to presentation
+
+https://docs.google.com/presentation/d/1j092IUsKge5XvswE18HGZPmz4NGRUtOXNunP9SOr3i0/edit?usp=sharing
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+fig_dir <- "C:/Users/user/Desktop/Panel2_full/Figures"
+
+if (!dir.exists(fig_dir)) {
+  dir.create(fig_dir, recursive = TRUE)
+}
+```
+
+
+```{r shell}
+# steinbock preprocess imc images --hpf 50
+# steinbock segment deepcell --minmax
+# steinbock measure intensities
+# steinbock measure regionprops
+# steinbock measure neighbors --type centroids --dmax 15
+```
+
+
+```{r load-libraries, message=FALSE}
+library(SingleCellExperiment)
+
+library(caret)
+library(xgboost)
+library(randomForest)
+
+library(imcRtools)
+library(cytomapper)
+library(CATALYST)
+
+library(scater)
+library(scuttle)
+library(scran)
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(tidyverse)
+library(purrr)
+
+library(ggplot2)
+library(ggrepel)
+library(viridis)
+library(patchwork)
+library(cowplot)
+library(ggridges)
+
+library(BiocParallel)
+library(doParallel)
+library(BiocNeighbors)
+
+library(ComplexHeatmap)
+library(circlize)
+
+library(FNN)
+library(igraph)
+
+library(dittoSeq)
+```
+
+```{r read-spe}
+base_path <- "C:/Users/user/Desktop/Panel2_full"
+
+raw_exprs_cofactor <- 5
+
+out_dir <- file.path(base_path, "ROut")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+spe <- read_steinbock(base_path, return_as = "spe")
+```
+
+# spillover
+
+```{r define-readSCEfromTIFF}
+readSCEfromTIFF <- function(x, image_df_path, panel_df_path) {
+  files <- list.files(x, pattern = "\\.tiff$", full.names = TRUE)
+  stopifnot(length(files) > 0)
+
+  panel <- read.csv(panel_df_path)
+
+  img_list <- lapply(files, EBImage::readImage)
+
+  arr_list <- lapply(img_list, function(img) {
+    arr <- as.array(img)
+    dim(arr) <- c(dim(arr)[1] * dim(arr)[2], dim(arr)[3])
+    t(arr)
+  })
+
+  counts_mat <- do.call(cbind, arr_list)
+
+  n_pix <- vapply(arr_list, ncol, integer(1))
+  sample_id <- rep(tools::file_path_sans_ext(basename(files)), times = n_pix)
+
+  colnames(counts_mat) <- paste0(sample_id, "_", sequence(n_pix))
+  rownames(counts_mat) <- paste0(panel$channel, "Di")
+
+  sce <- SingleCellExperiment::SingleCellExperiment(
+    assays = list(counts = counts_mat)
+  )
+
+  colData(sce)$sample_id <- sample_id
+
+  masses <- as.numeric(sub(".*?([0-9]+)$", "\\1", panel$channel))
+  file_index <- rep(seq_along(files), times = n_pix)
+
+  colData(sce)$sample_mass <- masses[file_index]
+
+  sce
+}
+
+```
+
+
+```{r}
+readSCEfromTIFF <- function(x, image_df_path, panel_df_path) {
+  files <- list.files(x, pattern = "\\.tiff$", full.names = TRUE)
+  stopifnot(length(files) > 0)
+
+  panel <- read.csv(panel_df_path)
+  images <- read.csv(image_df_path)
+
+  img_list <- lapply(files, EBImage::readImage)
+
+  arr_list <- lapply(img_list, function(img) {
+    arr <- as.array(img)
+    dim(arr) <- c(dim(arr)[1] * dim(arr)[2], dim(arr)[3])
+    t(arr)
+  })
+
+  counts_mat <- do.call(cbind, arr_list)
+
+  n_pix <- vapply(arr_list, ncol, integer(1))
+  sample_id <- rep(tools::file_path_sans_ext(basename(files)), times = n_pix)
+
+  colnames(counts_mat) <- paste0(sample_id, "_", sequence(n_pix))
+  rownames(counts_mat) <- paste0(panel$channel, "Di")
+  rownames(counts_mat)[rownames(counts_mat) == "ArAr80Di"] <- "Ar80Di"
+
+  sce <- SingleCellExperiment::SingleCellExperiment(
+    assays = list(counts = counts_mat)
+  )
+
+  colData(sce)$sample_id <- sample_id
+
+  file_names <- basename(files)
+  image_names <- images$image
+
+  image_row <- match(file_names, image_names)
+
+  mass_text <- paste(
+    images$acquisition_description[image_row],
+    images$source_file[image_row],
+    images$recovery_file[image_row]
+  )
+
+  sample_mass_file <- as.numeric(sub(".*?([0-9]{2,3}).*", "\\1", mass_text))
+
+  if (any(is.na(sample_mass_file))) {
+    stop("Some sample_mass values could not be extracted from images.csv")
+  }
+
+  colData(sce)$sample_mass <- rep(sample_mass_file, times = n_pix)
+
+  rowData(sce)$channel_name <- rownames(sce)
+  rowData(sce)$marker_name <- rownames(sce)
+
+  sce
+}
+```
+
+
+```{r read-compensated-tiff}
+comp_path <- list.files(base_path, pattern = "compensation$", full.names = TRUE)
+
+img_path <- file.path(comp_path, "img")
+image_csv <- file.path(comp_path, "images.csv")
+panel_csv <- file.path(comp_path, "panel.csv")
+
+sceTIFF <- readSCEfromTIFF(
+  x = img_path,
+  image_df_path = image_csv,
+  panel_df_path = panel_csv
+)
+
+sceTIFF$Panel <- basename(base_path)
+sceTIFF
+```
+
+# comp assay
+
+```{r process-compensated-sce}
+compensation_pixel_exprs_cofactor <- 5
+compensated_exprs_cofactor <- 1
+
+process_comp_sce <- function(x, minevents = 40) {
+  assay(x, "exprs") <- asinh(counts(x) / compensation_pixel_exprs_cofactor)
+
+  rownames(x)[rownames(x) == "ArAr80Di"] <- "Ar80Di"
+
+  rowData(x)$channel_name <- rownames(x)
+  rowData(x)$marker_name <- rownames(x)
+
+  bc_key <- as.numeric(unique(x$sample_mass))
+  bc_key <- bc_key[order(bc_key)]
+
+  channel_mass <- as.numeric(gsub("[^0-9]", "", rowData(x)$channel_name))
+  x <- x[channel_mass %in% bc_key, ]
+
+  rowData(x)$channel_name <- rownames(x)
+  rowData(x)$marker_name <- rownames(x)
+
+  print(bc_key)
+  print(rownames(x))
+
+  x <- assignPrelim(x, bc_key = bc_key)
+  x <- estCutoffs(x)
+  x <- applyCutoffs(x)
+
+  x <- filterPixels(
+    x,
+    minevents = minevents,
+    correct_pixels = TRUE
+  )
+
+  x <- computeSpillmat(x)
+
+  x
+}
+
+sceTIFF <- process_comp_sce(sceTIFF)
+sceTIFF
+```
+
+```{r fix-spillover-matrix-names}
+sm <- metadata(sceTIFF)$spillover_matrix
+
+colnames(sm) <- rownames(sm)
+
+metadata(sceTIFF)$spillover_matrix <- sm
+
+all(rownames(sm) %in% colnames(sm))
+setdiff(rownames(sm), colnames(sm))
+setdiff(colnames(sm), rownames(sm))
+```
+
+```{r spillover-plot, fig.width=11, fig.height=11}
+
+par(
+  mar = c(18, 18, 4, 4),
+  cex.axis = 0.7,
+  xpd = TRUE
+)
+
+plotSpillmat(
+  sceTIFF,
+  isotope_list = isotope_list
+)
+```
+
+
+```{r}
+sm <- metadata(sceTIFF)$spillover_matrix
+
+# The spillover matrix must have identical row and column names.
+# Do not manually rename the first column to Ar80Di here.
+colnames(sm) <- rownames(sm)
+
+# Check that the matrix is valid before compensation
+stopifnot(all(rownames(sm) == colnames(sm)))
+
+metadata(sceTIFF)$spillover_matrix <- sm
+
+# write.csv(sm, file.path(out_dir, "sm.csv"))
+
+rowData(spe)$channel_name <- paste0(rowData(spe)$channel, "Di")
+
+spe <- compCytof(
+  spe,
+  sm,
+  transform = TRUE,
+  cofactor = compensated_exprs_cofactor,
+  isotope_list = isotope_list,
+  overwrite = FALSE
+)
+
+assay(spe, "counts") <- assay(spe, "compcounts")
+assay(spe, "exprs") <- assay(spe, "compexprs")
+
+assay(spe, "compcounts") <- NULL
+assay(spe, "compexprs") <- NULL
+
+# already with comp assay
+spe
+
+saveRDS(spe, file.path(base_path, "ROut", "spe.rds"))
+
+```
+
+## already gated (labelled) images
+
+USL - the group of colorectal cancer (CRC) tissue samples/patients that came from University Saint-Luc (Brussels)
+
+```{r}
+spe <- readRDS(file.path(base_path, "ROut", "spe.rds"))
+
+gates <- list.files(
+  file.path(base_path, "gates"),
+  pattern = "\\.rds$",
+  full.names = TRUE,
+  recursive = TRUE
+)
+
+gate_labels <- purrr::map_dfr(gates, function(path) {
+  x <- readRDS(path)
+
+  data.frame(
+    sample_id = as.character(x$sample_id),
+    ObjectNumber = as.character(x$ObjectNumber),
+    cytomapper_CellLabel = as.character(x$cytomapper_CellLabel),
+    gate_file = basename(path),
+    row.names = NULL
+  )
+})
+
+gate_labels$cytomapper_CellLabel <- sub(
+  "_[0-9]+[a-zA-Z]?$",
+  "",
+  gate_labels$cytomapper_CellLabel
+)
+
+gate_labels$cytomapper_CellLabel <- sub(
+  " \\([0-9]+\\)$",
+  "",
+  gate_labels$cytomapper_CellLabel
+)
+
+gate_labels$cytomapper_CellLabel[gate_labels$cytomapper_CellLabel == "Cd4"] <- "CD4"
+gate_labels$cytomapper_CellLabel[gate_labels$cytomapper_CellLabel == "MDSC_"] <- "MDSC"
+gate_labels$cytomapper_CellLabel[gate_labels$cytomapper_CellLabel == "Cd8"] <- "CD8"
+
+
+gate_labels$cell_id <- paste0(gate_labels$sample_id, "_", gate_labels$ObjectNumber)
+
+sum(gate_labels$cell_id %in% colnames(spe))
+nrow(gate_labels)
+
+```
+## Quality Control of Cell Annotation Mapping
+
+```{r}
+length(unique(gate_labels$sample_id))
+length(unique(spe$sample_id))
+
+setdiff(unique(gate_labels$sample_id), unique(spe$sample_id))
+setdiff(unique(spe$sample_id), unique(gate_labels$sample_id))
+```
+```{r}
+length(unique(matched_gate_labels$sample_id))
+nrow(matched_gate_labels)
+table(matched_gate_labels$cytomapper_CellLabel)
+```
+
+
+# img, masks
+
+```{r}
+matched_gate_labels <- gate_labels[
+  gate_labels$cell_id %in% colnames(spe),
+]
+
+images_28 <- sort(unique(matched_gate_labels$sample_id))
+
+images_28_pattern <- paste0(
+  "^",
+  images_28,
+  "[.]tiff$",
+  collapse = "|"
+)
+
+images_28_obj <- loadImages(
+  file.path(base_path, "img"),
+  pattern = images_28_pattern,
+  BPPARAM = BiocParallel::SerialParam()
+)
+
+images_28_obj <- images_28_obj[images_28]
+channelNames(images_28_obj) <- rownames(spe)
+
+masks_28 <- loadImages(
+  file.path(base_path, "masks"),
+  pattern = images_28_pattern,
+  as.is = TRUE,
+  BPPARAM = BiocParallel::SerialParam()
+)
+
+masks_28 <- masks_28[names(images_28_obj)]
+```
+
+# Img QC
+
+```{r create-spe-28}
+spe_28 <- spe[, spe$sample_id %in% images_28]
+
+spe_28
+
+```
+
+
+```{r heatmap, fig.height=10, fig.width=10}
+image_mean <- aggregateAcrossCells(spe_28, 
+                                   ids = spe_28$sample_id, 
+                                   statistics="mean",
+                                   use.assay.type = "counts")
+
+assay(image_mean, "exprs") <- asinh(assay(image_mean, "counts"))
+
+genes_to_plot <- rownames(image_mean)[
+  rowSums(assay(image_mean, "exprs") != 0, na.rm = TRUE) > 0
+]
+if (length(genes_to_plot) == 0) {
+  stop("No selected markers have non-zero image-level expression values.")
+}
+
+dittoHeatmap(
+  image_mean, 
+  genes = genes_to_plot,
+  assay = "exprs", 
+  cluster_cols = FALSE, 
+  scale = "none",
+  heatmap.colors = colorRampPalette(c(
+    "white",
+    "#B8CAE2", "#9EB7D8", "#4575B4", "#325584", "#264164", "#182A40"
+  ))(100), 
+  show_colnames = TRUE
+)
+
+```
+
+
+```{r}
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+image_mean <- aggregateAcrossCells(
+  spe_28,
+  ids = spe_28$sample_id,
+  statistics = "mean",
+  use.assay.type = "counts"
+)
+
+assay(image_mean, "exprs") <- asinh(assay(image_mean, "counts"))
+
+genes_to_plot <- rownames(image_mean)[
+  rowSums(assay(image_mean, "exprs") != 0, na.rm = TRUE) > 0
+]
+
+mat <- assay(image_mean, "exprs")[genes_to_plot, ]
+
+colnames(mat) <- sub(".*IMC-02_", "img_", colnames(mat))
+
+col_fun <- colorRamp2(
+  c(0, 0.5, 1, 2, 4, max(mat, na.rm = TRUE)),
+  c("white", "#EAF2FB", "#B7CDE8", "#6FA8DC", "#1F4E79", "#08306B")
+)
+
+image_signal <- colSums(mat, na.rm = TRUE)
+
+top_anno <- HeatmapAnnotation(
+  Signal = anno_barplot(
+    image_signal,
+    border = FALSE,
+    gp = gpar(fill = "#2F5597"),
+    height = unit(1.5, "cm")
+  )
+)
+
+Heatmap(
+  mat,
+  name = "Mean exprs",
+  col = col_fun,
+  top_annotation = top_anno,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  row_names_side = "right",
+  row_names_gp = gpar(fontsize = 5),
+  column_names_gp = gpar(fontsize = 5),
+  column_names_rot = 40,
+  rect_gp = gpar(col = "grey90", lwd = 0.25)
+)
+```
+
+
+```{r}
+colSums(assay(image_mean, "exprs"))[
+  colnames(image_mean) == "10123883-USL-VAR-TIS-01-IMC-02_005"
+]
+```
+
+```{r}
+summary(
+  assay(image_mean, "exprs")[,
+    "10123883-USL-VAR-TIS-01-IMC-02_005"
+  ]
+)
+```
+
+delete 1 blank image from analysis
+
+```{r}
+spe_27 <- spe_28[
+  ,
+  spe_28$sample_id != "10123883-USL-VAR-TIS-01-IMC-02_005"
+]
+
+images_27 <- setdiff(
+  names(images_28_obj),
+  "10123883-USL-VAR-TIS-01-IMC-02_005"
+)
+
+images_27_obj <- images_28_obj[images_27]
+masks_27 <- masks_28[images_27]
+
+gate_labels <- gate_labels[
+  gate_labels$sample_id != "10123883-USL-VAR-TIS-01-IMC-02_005",
+]
+```
+
+
+## gating via cymoviewer
+
+```{r, message=FALSE}
+image_ids <- names(images_27_obj)
+mask_ids <- names(masks_27)
+spe_ids <- unique(as.character(spe_27$sample_id))
+
+stopifnot(
+  identical(image_ids, mask_ids),
+  setequal(image_ids, spe_ids),
+  !anyDuplicated(image_ids)
+)
+
+cur_mcols <- S4Vectors::DataFrame(
+  image = image_ids,
+  sample_id = image_ids,
+  name = image_ids,
+  row.names = image_ids
+)
+
+mcols(images_27_obj) <- cur_mcols
+mcols(masks_27)      <- cur_mcols
+
+
+identical(mcols(images_27_obj), mcols(masks_27))
+identical(mcols(images_27_obj)$sample_id, names(masks_27))
+setequal(
+  mcols(images_27_obj)$sample_id,
+  unique(as.character(spe_27$sample_id))
+)
+```
+
+```{r}
+if (interactive()) {
+  cytomapperShiny(object = spe_27, mask = masks_27, image = images_27_obj,
+                  cell_id = "ObjectNumber", img_id = "sample_id")
+}
+```
+
+
+## consolidating labels
+
+## cells assigned to the same class multiple times
+
+```{r}
+cur_tab <- unclass(table( #make a mat no table class
+  gate_labels$cell_id,
+  gate_labels$cytomapper_CellLabel
+))
+
+cur_tab_raw <- cur_tab
+
+same_label_duplicate_ids <- rownames(cur_tab_raw)[rowSums(cur_tab_raw > 1) > 0]
+
+if (length(same_label_duplicate_ids) > 0) {
+  cur_tab_raw[same_label_duplicate_ids, , drop = FALSE]
+} else {
+  print("No same-label duplicated gates found.")
+}
+```
+
+##Find duplicates
+
+```{r}
+cur_tab <- unclass(table(
+  gate_labels$cell_id,
+  gate_labels$cytomapper_CellLabel
+))
+
+cur_tab_raw <- cur_tab
+
+same_label_duplicate_ids <- rownames(cur_tab_raw)[
+  rowSums(cur_tab_raw > 1) > 0
+]
+```
+
+```{r}
+if (length(same_label_duplicate_ids) > 0) {
+  cur_tab_raw[same_label_duplicate_ids, , drop = FALSE]
+}
+```
+
+```{r}
+# Convert duplicated same-class labels to presence/absence
+cur_tab <- (cur_tab_raw > 0) * 1
+```
+
+
+## same label assigment
+
+```{r}
+cur_tab <- cur_tab_raw
+cur_tab[cur_tab > 1] <- 1
+
+# True multi-label doublets
+multi_label_doublet_ids <- rownames(cur_tab)[rowSums(cur_tab) > 1]
+
+if (length(multi_label_doublet_ids) > 0) {
+  head(cur_tab[multi_label_doublet_ids, , drop = FALSE],5)
+} else {
+  message("No multi-label doublets found.")
+}
+
+```
+
+# Consolidate labels
+
+```{r}
+#assign all cell_ids as doublets
+cur_labels <- rep("doublets", nrow(cur_tab))
+names(cur_labels) <- rownames(cur_tab) #cell IDs as names,
+
+single_index <- rowSums(cur_tab) == 1 #finds cells that have exactly one label
+
+# cells with exactly 1 label, this finds which column = 1
+cur_labels[single_index] <- colnames(cur_tab)[
+  apply(cur_tab[single_index, , drop = FALSE], 1, which.max)
+]
+
+#cells with exactly 2 labels, one = Tumor
+double_tumor_index <- rowSums(cur_tab) == 2 & cur_tab[, "Tumor"] == 1
+
+#cells = Tumor + one other label, "-" the Tumor, keeps the other label
+if (sum(double_tumor_index) > 0) {
+  no_tumor <- cur_tab[, colnames(cur_tab) != "Tumor", drop = FALSE]
+
+  cur_labels[double_tumor_index] <- colnames(no_tumor)[
+    apply(no_tumor[double_tumor_index, , drop = FALSE], 1, which.max)
+  ]
+} else {
+  message("No Tumor + other double labels found.")
+}
+
+#unresolved non-Tumor doublets
+removed_doublet_ids <- names(cur_labels)[cur_labels == "doublets"]
+
+#"-" anything that still calls doublets
+if (length(removed_doublet_ids) > 0) {
+  cur_labels <- cur_labels[cur_labels != "doublets"]
+} else {
+  message("No non-tumor doublets to remove.")
+}
+
+consolidation_stats <- data.frame(
+  category = c(
+    "total_unique_gated_cell_ids",
+    "same_label_duplicates_collapsed",
+    "single_label_kept",
+    "tumor_plus_other_renamed_to_other",
+    "non_tumor_doublets_removed"
+  ),
+  n = c(
+    nrow(cur_tab),
+    length(same_label_duplicate_ids),
+    sum(single_index),
+    sum(double_tumor_index),
+    length(removed_doublet_ids)
+  ),
+  row.names = NULL
+)
+
+consolidation_stats
+```
+```{r}
+consolidation_stats
+
+table(cur_labels)
+
+length(unique(cur_labels))
+```
+
+```{r}
+table(cur_labels)
+```
+
+
+```{r}
+sce_labels <- rep("unlabelled", ncol(spe_27))
+names(sce_labels) <- colnames(spe_27)
+
+matched_ids <- intersect(names(cur_labels), colnames(spe_27))
+unmatched_ids <- setdiff(names(cur_labels), colnames(spe_27))
+
+message("Matched gated cells: ", length(matched_ids))
+message("Unmatched gated cells: ", length(unmatched_ids))
+
+#replaces "unlabelled" with the final labels for matching gated cells
+sce_labels[matched_ids] <- cur_labels[matched_ids]
+
+#label vector still has exactly one entry per spe_27 column, in the same order
+stopifnot(length(sce_labels) == ncol(spe_27))
+stopifnot(identical(names(sce_labels), colnames(spe_27)))
+
+# final labels in colData(sce)
+spe_27$cell_labels <- sce_labels
+
+table(spe_27$cell_labels)
+
+```
+
+## visualization
+
+```{r}
+cell_types <- c(
+  B = "red3",
+  BnT = "indianred4",
+  CD4 = "palevioletred1",
+  CD8 = "darkorchid",
+  Treg = "maroon4",
+  NK = "yellow",
+  Igg = "darkred",
+
+  DC = "green4",
+  Mac = "darkolivegreen",
+  MacCD209 = "olivedrab1",
+  MacCD204 = "olivedrab3",
+  mregDC = "green",
+
+  Neutrophil = "blue1",
+  PMN_MDSC = "deepskyblue",
+  MDSC = "aquamarine4",
+
+  Vasculature = "brown2",
+  vCAF = "tomato",
+  Tumor = "sienna4",
+  SMA = "goldenrod2",
+  Fibro = "chocolate1",
+
+  unlabelled = "gray",
+  undefined = "black"
+)
+
+metadata(spe_27)$colour_vectors$cell_types <- cell_types
+```
+
+## QC
+
+
+```{r}
+## save labelled SPE objects
+
+data_out_path <- file.path(base_path, "ROut")
+dir.create(data_out_path, showWarnings = FALSE, recursive = TRUE)
+
+spe_all <- spe_27
+
+lab_sce <- spe_27[
+  ,
+  !is.na(spe_27$cell_labels) &
+    spe_27$cell_labels != "unlabelled"
+]
+
+saveRDS(
+  spe_all,
+  file.path(data_out_path, "spe_all_lab.rds")
+)
+
+saveRDS(
+  lab_sce,
+  file.path(data_out_path, "lab_spe.rds")
+)
+
+spe_all
+lab_sce
+```
+
+```{r}
+lab_sce <- spe_27[, !is.na(spe_27$cell_labels) & spe_27$cell_labels != "unlabelled"]
+
+# Aggregate mean expression per sample and cell label
+agr_sce <- scater::aggregateAcrossCells(
+  lab_sce,
+  ids = colData(lab_sce)[, c("sample_id", "cell_labels")],
+  statistics = "mean"
+)
+
+assay(agr_sce, "exprs") <- asinh(counts(agr_sce))
+
+# Clean column names
+colnames(agr_sce) <- paste0(agr_sce$sample_id, "_", agr_sce$cell_labels)
+
+# Markers used for visualization
+cur_markers <- rownames(spe_27)[
+  !grepl("DNA|Histone", rownames(spe_27), ignore.case = TRUE)
+]
+
+# Keep colors only for labels present in aggregated object
+cell_type_colors <- metadata(spe_27)$colour_vectors$cell_types
+cell_type_colors <- cell_type_colors[
+  names(cell_type_colors) %in% unique(agr_sce$cell_labels)
+]
+```
+
+
+```{r define-color-vector, fig.height=12, fig.width=10}
+dittoHeatmap(
+  agr_sce[cur_markers, ],
+  assay = "exprs",
+  annot.by = c("sample_id", "cell_labels"),
+  cluster_rows = FALSE,
+  scale = "none",
+  heatmap.colors = viridis::viridis(100),
+  order.by = "cell_labels",
+  annotation_colors = list(
+    cell_labels = cell_type_colors
+  )
+)
+```
+
+# train classifier
+
+## classifier rules
+
+```{r}
+lab_sce <- spe_27[, !is.na(spe_27$cell_labels) & spe_27$cell_labels != "unlabelled"]
+unlab_sce <- spe_27[, is.na(spe_27$cell_labels) | spe_27$cell_labels == "unlabelled"]
+
+# - Igg < 1
+exprs_mat <- assay(lab_sce, "exprs")
+low_igg <- lab_sce$cell_labels == "Igg" & exprs_mat["IgG", ] < 1
+lab_sce <- lab_sce[, !low_igg]
+
+# - NKs withCD7 expression < 0.5
+exprs_mat <- assay(lab_sce, "exprs")
+low_cd7_nk <- lab_sce$cell_labels == "NK" & exprs_mat["CD7", ] < 0.5
+lab_sce <- lab_sce[, !low_cd7_nk]
+
+# Relabel mregDC cells with high epithelial/tumor marker expression to Tumor
+exprs_mat <- assay(lab_sce, "exprs")
+mregdc_to_tumor <- lab_sce$cell_labels == "mregDC" &
+  (
+    exprs_mat["panCK", ] > 0.5 |
+      exprs_mat["Ecad", ] > 0.8
+  )
+
+lab_sce$cell_labels[mregdc_to_tumor] <- "Tumor"
+
+table(lab_sce$cell_labels)
+```
+## save lab_sce
+
+```{r}
+dat <- as.data.frame(unclass(table(lab_sce$sample_id,lab_sce$cell_labels)))
+dat
+```
+
+
+```{r}
+table(
+  label_status = ifelse(
+    spe_27$cell_labels == "unlabelled",
+    "unlabelled",
+    "labelled"
+  )
+)
+```
+
+## find a good test/train split
+
+## split data into test & train sets
+
+```{r}
+# Stratified train/test row split for multi-label count data.
+#
+# Each row is a sample with non-negative counts of each cell type in the
+# columns. The split is at the row level, but it targets *cell-level* totals:
+# achieved_test_frac[l] := test_count[l] / total[l] should be close to
+# `default_test_frac` for common labels and `rare_test_frac` for the labels
+# in `rare_labels` (default: "MDSC"). Additional labels whose total count is
+# below `rare_threshold` are treated as rare too, if that argument is given.
+#
+# Objective (minimized):
+#   sum_l  w_l * (test_count_l / total_l - target_frac_l)^2
+# with w_l = `rare_weight` for rare labels, 1 otherwise.
+#
+# Algorithm: random init (biased toward test for rows containing rare labels),
+# then steepest-descent single-row flips evaluated for all rows in one
+# vectorized matrix multiply per step. Repeated from `n_restarts` initial
+# seeds; the best basin wins. Converges in milliseconds for a few hundred
+# rows; scales as O(restarts * flips * n * L).
+
+split_test_rows <- function(counts,
+                            default_test_frac = 0.20,
+                            rare_test_frac    = 0.40,
+                            rare_labels       = c("MDSC"),
+                            rare_threshold    = NULL,
+                            rare_weight       = 1,
+                            n_restarts        = 100,
+                            seed              = 42) {
+  set.seed(seed)
+
+  if (is.data.frame(counts)) {
+    if (!is.numeric(counts[[1]])) {
+      rn     <- as.character(counts[[1]])
+      counts <- as.matrix(counts[, -1, drop = FALSE])
+      rownames(counts) <- rn
+    } else {
+      counts <- as.matrix(counts)
+    }
+  }
+  storage.mode(counts) <- "double"
+
+  labels <- colnames(counts)
+  totals <- colSums(counts)
+  n      <- nrow(counts)
+
+  if (!is.null(rare_threshold))
+    rare_labels <- union(rare_labels, labels[totals < rare_threshold])
+  rare_labels <- intersect(rare_labels, labels)
+  is_rare     <- labels %in% rare_labels
+
+  target_frac        <- ifelse(is_rare, rare_test_frac, default_test_frac)
+  names(target_frac) <- labels
+
+  # Zero out empty columns so they don't contribute a constant target_frac^2
+  # penalty that no flip can fix.
+  active     <- totals > 0
+  w          <- ifelse(is_rare, rare_weight, 1) * active
+  inv_totals <- ifelse(active, 1 / pmax(totals, 1), 0)
+
+  # rate[i,l] = counts[i,l] / total[l]; precomputed once.
+  rate      <- counts * rep(inv_totals, each = n)
+  rate_sq_w <- as.numeric(rate^2 %*% w)   # length n, constant across iterations
+
+  # Bias rows containing rare-label cells toward starting in test.
+  has_rare  <- if (any(is_rare)) rowSums(counts[, is_rare, drop = FALSE]) > 0
+               else rep(FALSE, n)
+  init_prob <- ifelse(has_rare, rare_test_frac, default_test_frac)
+
+  best_score   <- Inf
+  best_in_test <- logical(n)
+
+  for (restart in seq_len(n_restarts)) {
+    in_test  <- runif(n) < init_prob
+    test_sum <- colSums(counts[in_test, , drop = FALSE])
+
+    repeat {
+      cur_err   <- test_sum * inv_totals - target_frac
+      cur_score <- sum(w * cur_err * cur_err)
+
+      sgn        <- 1 - 2 * in_test                            # +1 = will add to test, -1 = will leave test
+      linear     <- as.numeric(rate %*% (w * cur_err))
+      flip_delta <- 2 * sgn * linear + rate_sq_w               # change in objective for each candidate flip
+
+      best_i <- which.min(flip_delta)
+      if (flip_delta[best_i] >= -1e-12) break                  # local minimum reached
+
+      test_sum        <- test_sum + sgn[best_i] * counts[best_i, ]
+      in_test[best_i] <- !in_test[best_i]
+    }
+
+    if (cur_score < best_score) {
+      best_score   <- cur_score
+      best_in_test <- in_test
+    }
+  }
+
+  test_sum <- colSums(counts[best_in_test, , drop = FALSE])
+  achieved <- ifelse(active, test_sum * inv_totals, NA_real_)
+
+  summary_df <- data.frame(
+    label              = labels,
+    total              = totals,
+    test_count         = test_sum,
+    train_count        = totals - test_sum,
+    target_test_frac   = target_frac,
+    achieved_test_frac = round(achieved, 3),
+    is_rare            = is_rare,
+    row.names          = NULL
+  )
+
+  list(
+    test_idx       = which(best_in_test),
+    train_idx      = which(!best_in_test),
+    test_rownames  = rownames(counts)[best_in_test],
+    train_rownames = rownames(counts)[!best_in_test],
+    summary        = summary_df,
+    score          = best_score
+  )
+}
+```
+
+
+## looking for a seed with the best distribution between train/test
+
+```{r}
+res <- split_test_rows(
+  dat,
+  default_test_frac = 0.30,
+  rare_test_frac = 0.30,
+  rare_labels = c("B", "BnT", "Igg", "mregDC", "NK"),
+  rare_weight = 10,
+  n_restarts = 3000,
+  seed = 42
+)
+
+res$summary
+```
+
+```{r train-test-split-summary}
+test_sce <- lab_sce[, lab_sce$sample_id %in% res$test_rownames]
+train_sce <- lab_sce[, lab_sce$sample_id %in% res$train_rownames]
+
+all_labels <- sort(unique(c(
+  as.character(train_sce$cell_labels),
+  as.character(test_sce$cell_labels)
+)))
+
+split_stats <- data.frame(
+  label = all_labels,
+  train = as.integer(table(factor(train_sce$cell_labels, levels = all_labels))),
+  test = as.integer(table(factor(test_sce$cell_labels, levels = all_labels)))
+) |>
+  dplyr::mutate(test_frac = round(test / (train + test), 3))
+
+split_stats
+mean(split_stats$test_frac, na.rm = TRUE)
+
+```
+```{r}
+summary(split_stats$test_frac)
+
+split_stats |>
+  dplyr::arrange(test_frac)
+```
+
+
+```{r}
+test_sce <- lab_sce[, lab_sce$sample_id %in% res$test_rownames]
+train_sce <- lab_sce[, lab_sce$sample_id %in% res$train_rownames]
+```
+
+## train/test split summary
+
+```{r}
+all_labels <- sort(unique(c(
+  as.character(train_sce$cell_labels),
+  as.character(test_sce$cell_labels)
+)))
+
+all_labels <- all_labels[
+  !is.na(all_labels) &
+    all_labels != "unlabelled"
+]
+
+train_tab <- table(
+  factor(as.character(train_sce$cell_labels), levels = all_labels)
+)
+
+test_tab <- table(
+  factor(as.character(test_sce$cell_labels), levels = all_labels)
+)
+
+split_stats <- data.frame(
+  cell_label = all_labels,
+  train_n = as.integer(train_tab),
+  test_n = as.integer(test_tab),
+  row.names = NULL
+)
+
+split_stats
+```
+
+## rare cell types distribition between samples
+
+```{r}
+rare_celltypes <- c("BnT", "Igg", "MDSC", "mregDC", "vCAF")
+
+rare_balance <- bind_rows(
+  as.data.frame(colData(train_sce)) |> 
+    mutate(split = "train"),
+  as.data.frame(colData(test_sce)) |> 
+    mutate(split = "test")
+) |> 
+  dplyr::filter(cell_labels %in% rare_celltypes) |> 
+  group_by(split, cell_labels) |> 
+  summarise(
+    total_cells = n(),
+    n_samples = n_distinct(sample_id),
+    .groups = "drop"
+  ) |> 
+  arrange(split, cell_labels)
+
+rare_balance
+```
+## Train-Test Split Quality Assessment
+
+```{r}
+mean(res$summary$achieved_test_frac)
+summary(res$summary$achieved_test_frac)
+```
+
+
+```{r}
+res$summary |>
+  dplyr::select(
+    label,
+    train_count,
+    test_count,
+    achieved_test_frac
+  ) |>
+  dplyr::arrange(desc(test_count))
+```
+```{r}
+res$summary |>
+  dplyr::filter(train_count < 50 | test_count < 20)
+```
+
+
+
+## prepare data for classifier
+
+1. split the labelled data into training + test data at the image level by `sample_id`. 
+All cells from the same image are assigned training or test set
+
+The split was generated with 5 grouped folds using `groupKFold`, 
+and `Fold5` was used as the held-out test set. 
+
+Within the training set another 5-fold grouped cross-validation for XGBoost parameter tuning was applied
+
+```{r prepare-data, message = FALSE, eval=TRUE}
+
+# Create unique cell identifiers so each cell can be traced back to its image
+# and object number after training, prediction, or error analysis.
+train_sce$cell_id <- paste0(train_sce$sample_id, "_", train_sce$ObjectNumber)
+test_sce$cell_id <- paste0(test_sce$sample_id, "_", test_sce$ObjectNumber)
+
+colnames(train_sce) <- train_sce$cell_id
+colnames(test_sce) <- test_sce$cell_id
+
+marker_keep <- !grepl("DNA|Histone", rownames(train_sce))
+
+# XGBoost expects cells as rows and features as columns.
+# The assay matrix has markers as rows and cells as columns, so we transpose it.
+X <- t(assay(train_sce, "exprs")[marker_keep, ])
+X_test_all <- t(assay(test_sce, "exprs")[marker_keep, ])
+
+stopifnot(identical(colnames(X), colnames(X_test_all)))
+stopifnot(!anyDuplicated(colnames(X)))
+
+# XGBoost requires numeric class labels starting at 0.
+# The factor levels from the training set define the fixed mapping between
+# numeric class IDs and biological cell labels.
+y_true <- factor(train_sce$cell_labels)
+label_mapping <- levels(y_true)
+
+# Convert training labels from factors to 0-based numeric labels.
+y <- as.integer(y_true) - 1
+
+# Number of classes required by the multiclass XGBoost objective.
+num_classes <- length(label_mapping)
+
+stopifnot(!anyNA(y))
+stopifnot(min(y) == 0)
+stopifnot(max(y) == num_classes - 1)
+
+# Keep only labelled test cells for evaluation.
+# Unlabelled cells are excluded from Xy_test because XGBoost cannot accept NA labels.
+test_eval_keep <- !is.na(test_sce$cell_labels) &
+  test_sce$cell_labels != "unlabelled" &
+  test_sce$cell_labels %in% label_mapping
+
+X_test_eval <- t(assay(test_sce, "exprs")[marker_keep, test_eval_keep])
+
+y_test_true <- factor(
+  test_sce$cell_labels[test_eval_keep],
+  levels = label_mapping
+)
+
+y_test <- as.integer(y_test_true) - 1
+
+stopifnot(!anyNA(y_test))
+stopifnot(min(y_test) >= 0)
+stopifnot(max(y_test) <= num_classes - 1)
+
+# Inverse-frequency class weights so rare cell types contribute more
+# to the loss function during training.
+w_class <- 1 / (table(y_true) / length(y_true))
+
+# Down-weight undefined and IgG classes so they do not dominate the classifier
+# despite being noisy or less biologically informative labels.
+if ("undefined" %in% names(w_class)) {
+  w_class["undefined"] <- w_class["undefined"] / 10
+}
+
+if ("Igg" %in% names(w_class)) {
+  w_class["Igg"] <- w_class["Igg"] / 30
+}
+
+# Convert class-level weights into one weight per training cell.
+# Rescale weights to mean 1 for numerical stability.
+w <- as.numeric(w_class[y_true])
+w <- w / mean(w)
+
+# Training data: features, labels, and cell weights.
+Xy <- xgboost::xgb.DMatrix(
+  data = X,
+  label = y,
+  weight = w
+)
+
+# Labelled held-out test data, for evaluation only.
+Xy_test <- xgboost::xgb.DMatrix(
+  data = X_test_eval,
+  label = y_test
+)
+
+# All held-out/test cells, including unlabelled cells, for prediction/classification.
+Xy_test_all <- xgboost::xgb.DMatrix(
+  data = X_test_all
+)
+
+test_eval_cell_ids <- colnames(test_sce)[test_eval_keep]
+test_all_cell_ids <- colnames(test_sce)
+
+table(y_test_true)
+```
+
+## check the rules
+
+Here it is clearly seen the upward rules for the specific markers work
+
+# TEMP / QC plots
+```{r}
+coldat <- as.data.frame(t(assay(train_sce, "exprs")))
+coldat$label <- train_sce$cell_labels
+
+ggplot(coldat |> dplyr::filter(label == "Igg"),
+       aes(x = IgG, y = DNA1, col = label)) +
+  geom_point() +
+  geom_vline(xintercept = 1, linetype = "dashed") +
+  theme_bw()
+
+ggplot(coldat |> dplyr::filter(label == "mregDC"),
+       aes(x = Ecad, y = panCK, col = label)) +
+  geom_point() +
+  geom_hline(yintercept = 0.5, linetype = "dashed") +
+  geom_vline(xintercept = 0.8, linetype = "dashed") +
+  theme_bw()
+
+```
+
+## params for classofier, cross validation
+
+All heavy calculations are here
+
+```{r train-model-cv, message = FALSE, eval = TRUE}
+
+# Make sure cells from the same image are not split across CV train/test folds.
+# groupKFold returns training indices, while xgb.cv expects validation indices,
+# so we convert each fold to the held-out indices.
+cv_train_index <- caret::groupKFold(
+  group = factor(train_sce$sample_id),
+  k = 5
+)
+
+all_indices <- seq_len(ncol(train_sce))
+
+fold_list <- lapply(
+  cv_train_index,
+  function(train_idx) setdiff(all_indices, train_idx)
+)
+
+# XGBoost builds an ensemble of decision trees sequentially
+# Each new tree tries to correct the errors made by the previous trees
+
+param_grid <- expand.grid( #creates all combinations of the parameter values 3 * 2 * 1 * 1 * 2 = 12 models
+  
+  # Maximum depth of each tree.
+  # Smaller values make simpler trees and reduce overfitting
+  # Larger values allow more complex interactions between markers
+  max_depth = c(3, 4, 5),
+
+  # Learning rate controls how much each new tree contributes to the final model
+  # < eta usually needs more trees but can generalize better
+  eta = c(0.05, 0.1),
+
+  # Fraction of cells sampled for each tree
+  # Subsampling reduces overfitting by making trees less correlated
+  subsample = c(0.8), #for each tree, XGBoost randomly uses 80% of the training cells and leaves out the other 20%
+
+  # fraction of markers/features sampled for each tree, reduces overfitting and makes the model more robust.
+  colsample_bytree = c(0.8), #40 * 0.8 = 32 markers
+
+  # Minimum amount of weighted data required in a child node.
+  # Higher values make the model more conservative, especially for rare classes
+  min_child_weight = c(1, 5)
+)
+
+# Max N of boosting rounds, 1 round adds one tree per class for multiclass classification
+# Early stopping below can stop before this limit if validation loss stops improving
+nround <- 300
+
+# Store the full CV models and a compact summary of their performance.
+models <- list()
+cv_summary <- list()
+
+# Loop over all parameter combinations
+for (i in seq_len(nrow(param_grid))) {
+  
+  # Parameters for the current XGBoost model
+  params <- list(
+    booster = "gbtree",
+
+    # Multiclass classification with predicted probabilities for each cell type
+    objective = "multi:softprob",
+
+    # Optimize and monitor multiclass log-loss.
+    #  <  mlogloss means predicted probabilities are closer to true labels.
+    eval_metric = "mlogloss", #CD8 probability = 0.95 - low loss, good
+
+    # Number of cell-type classes.
+    num_class = num_classes,
+
+    max_depth = param_grid$max_depth[i],
+    eta = param_grid$eta[i],
+    subsample = param_grid$subsample[i],
+    colsample_bytree = param_grid$colsample_bytree[i],
+    min_child_weight = param_grid$min_child_weight[i],
+
+    # Histogram-based tree construction, faster for larger datasets.
+    tree_method = "hist",
+    nthread = max(1, parallel::detectCores() - 1)
+  )
+  
+  message(
+    "Running: max_depth=", params$max_depth,
+    "; eta=", params$eta,
+    "; subsample=", params$subsample,
+    "; colsample_bytree=", params$colsample_bytree,
+    "; min_child_weight=", params$min_child_weight
+  )
+  
+  # Cross-validation on image-level folds.
+  # Each fold holds out complete images, so cells from the same image are not
+  # split between training and validation.
+  cv_results <- xgboost::xgb.cv(
+    params = params,
+    data = Xy,
+    folds = fold_list, #@Round 1: train Fold2 + Fold3 + Fold4 + Fold5, test Fold1, etc.
+    nrounds = nround, #300 ceiling, 107 - best
+
+    # Stop if validation log-loss does not improve for 20 rounds.
+    # This helps prevent overfitting and saves computation time.
+    early_stopping_rounds = 20, #can go more after the best (108), if not will keep 108
+
+    verbose = F, #if T - there is a message about the ML process
+
+    # During grid search we only need test loss, not cell-level predictions
+    prediction = F
+  )
+  
+  models[[i]] <- cv_results
+  
+  # Select the boosting round with the lowest validation log-loss.
+  best_iteration <- which.min(cv_results$evaluation_log$test_mlogloss_mean)
+  best_mlogloss <- cv_results$evaluation_log$test_mlogloss_mean[best_iteration]
+
+  # Store parameter values and their best CV score.
+  cv_summary[[i]] <- data.frame(
+    param_grid[i, ],
+    best_iteration = best_iteration,
+    best_mlogloss = best_mlogloss
+  )
+}
+
+# Combine all model summaries into one table for selecting the best parameters.
+cv_summary <- bind_rows(cv_summary)
+```
+
+
+```{r show-cv-summary}
+cv_summary |> 
+  dplyr::arrange(best_mlogloss)
+```
+
+
+## cross-validation on the best param
+
+```{r select-best-model, message = FALSE, eval = TRUE}
+# parameter combination with the lowest cross-validation log-loss
+best_params <- cv_summary |> 
+  arrange(best_mlogloss) |> 
+  dplyr::slice(1)
+
+best_params
+
+# > best_params
+#   max_depth eta subsample colsample_bytree
+# 1         4 0.1       0.8              0.8
+#   min_child_weight best_iteration best_mlogloss
+# 1                5            108      0.292158
+
+# Use the best number of boosting rounds found during CV.
+# This is the round with the lowest validation log-loss before early stopping.
+best_nrounds <- as.integer(best_params$best_iteration)
+
+# Define the final set of XGBoost parameters selected by grid search.
+params_best <- list(
+  booster = "gbtree",
+
+  # Multiclass classification with class probabilities as output.
+  objective = "multi:softprob",
+
+  # Evaluation metric used during tuning.
+  eval_metric = "mlogloss",
+
+  # Number of cell-label classes.
+  num_class = num_classes,
+
+  # Best tree and regularization parameters from CV.
+  max_depth = as.integer(best_params$max_depth),
+  eta = best_params$eta,
+  subsample = best_params$subsample,
+  colsample_bytree = best_params$colsample_bytree,
+  min_child_weight = best_params$min_child_weight,
+
+  # Faster tree construction for larger datasets.
+  tree_method = "hist",
+  nthread = max(1, parallel::detectCores() - 1)
+)
+
+# Rerun cross-validation only for the selected best model.
+# Here prediction = TRUE stores out-of-fold predictions for each training cell.
+# These predictions are used to estimate per-cell-type performance.
+best_cv <- xgboost::xgb.cv(
+  params = params_best,
+  data = Xy,
+  folds = fold_list,
+  nrounds = best_nrounds,
+  verbose = FALSE,
+  prediction = TRUE
+)
+
+```
+
+
+## Check CV accuracy per cell type for the best model
+
+```{r cv-oof-predictions, fig.height=8, fig.width=12}
+# Extract out-of-fold predicted class probabilities from the best CV model.
+# Rows are cells, columns are cell-label classes.
+cv_prob <- best_cv$cv_predict
+
+if (is.list(cv_prob)) {
+  cv_prob <- do.call(rbind, cv_prob)
+}
+
+if (is.null(dim(cv_prob))) {
+  cv_prob <- matrix(
+    cv_prob,
+    ncol = num_classes,
+    byrow = TRUE
+  )
+}
+
+cv_prob <- as.matrix(cv_prob)
+storage.mode(cv_prob) <- "double"
+
+# Check that the prediction matrix has one row per training cell
+# and one column per cell-label class.
+stopifnot(nrow(cv_prob) == length(y))
+stopifnot(ncol(cv_prob) == num_classes)
+
+# Convert predicted probabilities to predicted cell labels.
+# max.col() finds the class with the highest probability for each cell.
+# label_mapping converts numeric class positions back to cell-type names.
+cv_pred <- factor(
+  label_mapping[max.col(cv_prob)],
+  levels = label_mapping
+)
+
+# Compare predicted labels against the true training labels.
+# Because predictions are out-of-fold, each cell was predicted by a model
+# that was not trained on that cell/image.
+cm_cv <- caret::confusionMatrix(
+  data = cv_pred,
+  reference = y_true
+)
+
+# cm_cv$table
+#              Reference
+# Prediction        B   BnT   CD4   CD8    DC Fibro   Igg   Mac MacCD204 MacCD209
+#   B             587     2     0     0     2     0     1     0        0        0
+#   BnT             0   230     1     0     0     0     0     0        0        0
+#   CD4             5    12  1796    21     2     0     3     0        0        2
+#   CD8             0     1     9  2464     3     0     0     0        2        1
+#   DC              1     0     0     0   346     0     0     0       11        2
+#   Fibro           0     0     1     1     3   738    55     0        0        2
+#   Igg             0     0     0     0     0    21    66     0        0        0
+#   Mac             0     0     0     0     0     0     0   509       66       27
+#   MacCD204        0     0     1     0    11     3     1    36     2711        1
+#   MacCD209        0     1     2     0     1     1    13    50        1      328
+#   MDSC            0     0     0     0     0     0     0     0        0        0
+#   mregDC          0     0     1     0     0     1     0     1        2        2
+#   Neutrophil      0     0     0     0     0     0     0     0        0        0
+#   NK              0     0     1     0     1     4     0     0        0        0
+#   PMN_MDSC        0     0     1     0     0     0     0     0        0        0
+#   SMA             0     0     0     0     0    12     0     0        0        0
+#   Treg            0     1     9     1     0     0     1     0        1        1
+#   Tumor           0     0     1     0     0    80     0     0        0        0
+#   undefined       0     0    20     1     0     2     1     0        0        0
+#   Vasculature     0     0     0     1     0     0     0     0        0        0
+#   vCAF            0     0     0     0     0     0     0     0        0        0
+```
+
+check where fibroblasts come from
+
+```{r}
+train_sce$predicted <- cv_pred
+table(train_sce$predicted,train_sce$cell_labels)
+table(train_sce$cell_labels)
+table(test_sce$cell_labels)
+cur_sce <- train_sce[,train_sce$cell_labels == "Tumor" & train_sce$predicted == "Fibro"]
+table(cur_sce$sample_id)
+table(cur_sce$predicted,cur_sce$cell_labels)
+```
+
+
+```{r cv-accuracy-per-celltype}
+
+cat(
+  "Accuracy =", round(cm_cv$overall["Accuracy"], 4), "\n",
+  "Kappa =", round(cm_cv$overall["Kappa"], 4), "\n",
+  "AccuracyLower =", round(cm_cv$overall["AccuracyLower"], 4), "\n",
+  "AccuracyUpper =", round(cm_cv$overall["AccuracyUpper"], 4), "\n",
+  "AccuracyNull =", round(cm_cv$overall["AccuracyNull"], 4), "\n",
+  "AccuracyPValue =", signif(cm_cv$overall["AccuracyPValue"], 3), "\n",
+  "McnemarPValue =", cm_cv$overall["McnemarPValue"], "\n\n",
+  sep = ""
+)
+
+# 97.97% of out-of-fold predictions are correct.
+# Kappa corrects for agreement expected by chance/class imbalance; excellent agreement.
+# AccuracyNull is the accuracy obtained by always predicting the most common class.
+
+# AccuracyPValue = 0
+# The model performs significantly better than a null/majority-class classifier.
+# McnemarPValue = NaN (not informative in this setting).
+```
+
+```{r cv-byclass-performance, fig.height=8, fig.width=12}
+cm_cv$byClass
+
+# > cm_cv$byClass
+#                    Sensitivity Specificity Pos Pred Value
+# Class: B             0.9898820   0.9998836      0.9882155
+# Class: BnT           0.9311741   0.9999669      0.9913793
+# Class: CD4           0.9744981   0.9989474      0.9666308
+# Class: CD8           0.9899558   0.9996567      0.9919485
+# Class: DC            0.9376694   0.9995859      0.9326146
+
+# Sensitivity (true positive rate): of all true cells of that class,
+# how many were correctly identified.
+
+# Specificity: of all cells that do not belong to that class,
+# how many were correctly excluded.
+
+# Positive Predictive Value (precision): of all cells predicted as that class,
+# how many truly belong to that class.
+
+# B, CD4 and CD8 show particularly strong classification performance.
+```
+
+
+## FPR vs TPR on the best model param
+
+```{r accuracy-per-cell-type, fig.height=8, fig.width=12}
+cv_perf <- data.frame(cm_cv$byClass) |> 
+  mutate(
+    class = sub("Class: ", "", rownames(cm_cv$byClass)),
+    fpr = 1 - Specificity
+  )
+
+ggplot(cv_perf) +
+  geom_point(
+    aes(
+      x = fpr,
+      y = Sensitivity,
+      size = Detection.Rate,
+      fill = class
+    ),
+    shape = 21,
+    color = "black",
+    alpha = 0.9
+  ) +
+  ggrepel::geom_text_repel(
+    aes(
+      x = fpr,
+      y = Sensitivity,
+      label = class
+    ),
+    size = 3,
+    max.overlaps = Inf,
+    min.segment.length = 0,
+    box.padding = 0.3,
+    point.padding = 0.2
+  ) +
+  scale_fill_manual(
+    values = metadata(spe_27)$colour_vectors$cell_types,
+    guide = "none"
+  ) +
+  scale_size(
+    range = c(1, 15),
+    guide = guide_legend(title.position = "top")
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "top",
+    legend.title = element_text(hjust = 0.5)
+  ) +
+  ylab("Sensitivity (TPR)") +
+  xlab("1 - Specificity (FPR)")
+
+```
+
+
+
+
+## check best model 
+extract evaluation dataframes
+
+```{r extract-evaluation-dataframes}
+#models <- readRDS(file.path(base_path, "ROut_rds_all", "models.rds"))
+
+eval_data <- purrr::imap_dfr(models, function(model, model_id) {
+  
+  df <- model$evaluation_log
+  
+  best_iteration <- which.min(df$test_mlogloss_mean)
+  best_mlogloss <- df$test_mlogloss_mean[best_iteration]
+  
+  df |> 
+    mutate(
+      model_id = model_id,
+      max_depth = model$params$max_depth,
+      eta = model$params$eta,
+      subsample = model$params$subsample,
+      colsample_bytree = model$params$colsample_bytree,
+      min_child_weight = model$params$min_child_weight,
+      best_iteration = best_iteration,
+      best_mlogloss = best_mlogloss,
+      is_best_iteration = iter == best_iteration
+    ) |> 
+    pivot_longer(
+      cols = c(
+        train_mlogloss_mean,
+        train_mlogloss_std,
+        test_mlogloss_mean,
+        test_mlogloss_std
+      ),
+      names_to = c("Type", ".value"),
+      names_pattern = "(train|test)_mlogloss_(mean|std)"
+    ) |> 
+    dplyr::rename(
+      mlogloss_mean = mean,
+      mlogloss_std = std
+    ) |> 
+    mutate(
+      Type = stringr::str_to_title(Type),
+      max_depth = as.factor(max_depth),
+      eta = as.factor(eta),
+      min_child_weight = as.factor(min_child_weight),
+      params = paste(
+        "depth", max_depth,
+        "eta", eta,
+        "sub", subsample,
+        "col", colsample_bytree,
+        "mcw", min_child_weight,
+        sep = "_"
+      )
+    )
+})
+
+eval_data
+```
+
+```{r best-model-summary}
+best_model_summary <- eval_data |> 
+  dplyr::filter(Type == "Test", is_best_iteration) |> 
+  arrange(best_mlogloss) |> 
+  select(
+    model_id,
+    max_depth,
+    eta,
+    subsample,
+    colsample_bytree,
+    min_child_weight,
+    best_iteration,
+    best_mlogloss,
+    params
+  )
+
+best_model_summary
+
+```
+
+
+
+## visualize model evaluation
+
+```{r model-evaluation}
+plot_heatmap_data <- eval_data |> 
+  dplyr::group_by(
+    Type,
+    eta,
+    subsample,
+    colsample_bytree,
+    min_child_weight,
+    max_depth
+  ) |> 
+  dplyr::summarise(
+    mlogloss = min(mlogloss_mean),
+    .groups = "drop"
+  ) |> 
+  dplyr::mutate(
+    eta = as.factor(eta),
+    subsample = as.factor(subsample),
+    colsample_bytree = as.factor(colsample_bytree),
+    min_child_weight = as.factor(min_child_weight),
+    max_depth = as.factor(max_depth)
+  )
+```
+
+```{r model-evaluation-2}
+make_heatmap <- function(plot_data, cur_type, show_param_annotation = TRUE) {
+  
+  df <- plot_data |> 
+    dplyr::filter(Type == cur_type) |> 
+    arrange(
+      eta,
+      subsample,
+      colsample_bytree,
+      min_child_weight,
+      max_depth
+    ) |> 
+    pivot_wider(
+      names_from = max_depth,
+      values_from = mlogloss
+    )
+  
+  depth_cols <- sort(unique(as.character(plot_data$max_depth)))
+  
+  mat <- df |> 
+    select(dplyr::all_of(depth_cols)) |> 
+    as.matrix()
+  
+  cur_col_fun <- if (cur_type == "Train") {
+  circlize::colorRamp2(
+    c(
+      min(mat, na.rm = TRUE),
+      median(mat, na.rm = TRUE),
+      max(mat, na.rm = TRUE)
+    ),
+    c("#2166ac", "white", "#b2182b")
+  )
+} else {
+  circlize::colorRamp2(
+    c(
+      min(mat, na.rm = TRUE),
+      median(mat, na.rm = TRUE),
+      max(mat, na.rm = TRUE)
+    ),
+    c("darkgreen", "white", "red")
+  )
+}
+  
+  anno_colors <- list(
+  "learning rate" = c(
+    "0.05" = "#1b9e77",
+    "0.1"  = "#d95f02"
+  ),
+  "cell subsampl" = c(
+    "0.8" = "#7570b3"
+  ),
+  "marker subsam" = c(
+    "0.8" = "#66a61e"
+  ),
+  "min child w" = c(
+    "1" = "#e7298a",
+    "5" = "#e6ab02"
+  )
+)
+  
+  row_anno <- if (show_param_annotation) {
+    ComplexHeatmap::rowAnnotation(
+      "learning rate" = df$eta,
+      "cell subsampl" = df$subsample,
+      "marker subsam" = df$colsample_bytree,
+      "min child w" = df$min_child_weight,
+      col = anno_colors
+    )
+  } else {
+    NULL
+  }
+  
+  ComplexHeatmap::Heatmap(
+    mat,
+    name = paste0(cur_type, "\nmlogloss"),
+    column_title = paste0(cur_type, " multiclass log-loss"),
+    column_title_gp = grid::gpar(fontsize = 12, fontface = "bold"),
+    col = cur_col_fun,
+    left_annotation = row_anno,
+    cluster_rows = FALSE,
+    cluster_columns = FALSE,
+    show_column_names = TRUE,
+    column_names_gp = grid::gpar(fontsize = 10),
+    show_row_names = FALSE,
+    cell_fun = function(j, i, x, y, width, height, fill) {
+      grid::grid.text(
+        sprintf("%.3f", mat[i, j]),
+        x,
+        y,
+        gp = grid::gpar(fontsize = 9)
+      )
+    }
+  )
+}
+
+hm_train <- make_heatmap(plot_heatmap_data, "Train", show_param_annotation = TRUE)
+hm_test  <- make_heatmap(plot_heatmap_data, "Test", show_param_annotation = FALSE)
+
+```
+
+
+
+```{r model-evaluation-heatmap, fig.height=7.5, fig.width=12}
+hm_train + hm_test
+```
+
+
+The best cross-validation performance was obtained with 
+eta = 0.1, subsample = 0.8, colsample_bytree = 0.8, 
+min_child_weight = 5, and max_depth = 3. 
+
+The test mlogloss indicates that max_depth = 3 gives the best balance between model complexity and generalization, 
+while deeper trees tend to reduce train loss but increase test loss, suggesting overfitting. 
+
+The higher min_child_weight value performs better, 
+indicating that a more conservative tree-splitting strategy is preferable for these data
+
+
+```{r best-model-summary-table, fig.height=10, fig.width=12}
+best_model_summary <- eval_data |> 
+  dplyr::filter(Type == "Test", is_best_iteration) |> 
+  arrange(best_mlogloss) |> 
+  dplyr::slice(1)
+
+best_model_summary
+```
+
+
+```{r best-model-evaluation-curve, fig.height=10, fig.width=12}
+best_param_name <- best_model_summary$params
+best_iter <- best_model_summary$best_iteration
+best_loss <- best_model_summary$best_mlogloss
+
+```
+
+
+
+```{r model-evaluation-curves, fig.height=10, fig.width=14}
+ggplot(
+  eval_data,
+  aes(
+    x = iter,
+    y = mlogloss_mean,
+    color = params,
+    group = params
+  )
+) +
+  geom_line(alpha = 0.75, linewidth = 0.6) +
+  geom_vline(
+    data = best_model_summary,
+    aes(xintercept = best_iteration),
+    inherit.aes = FALSE,
+    linetype = "dashed",
+    color = "black"
+  ) +
+  geom_point(
+    data = best_model_summary,
+    aes(
+      x = best_iteration,
+      y = best_mlogloss
+    ),
+    inherit.aes = FALSE,
+    size = 3,
+    color = "black"
+  ) +
+  facet_grid(rows = vars(Type), cols = vars(eta), scales = "free_y") +
+  scale_color_brewer(palette = "Set3") +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "none",
+    legend.title = element_blank()
+  ) +
+  labs(
+    title = "XGBoost Multiclass Log-Loss Across Boosting Iterations",
+    subtitle = paste0(
+      "Best CV model: ",
+      best_param_name,
+      "; iteration = ", best_iter,
+      "; test mlogloss = ", round(best_loss, 3)
+    ),
+    x = "Boosting iteration",
+    y = "Mean multiclass log-loss"
+  )
+```
+
+
+Columns separate the learning rate values: eta = 0.05 on the left and eta = 0.1 on the right. 
+In both training and test panels, log-loss decreases as more boosting iterations are added. 
+Training loss continues to approach zero, especially for more flexible models, while test loss decreases initially and then plateaus. 
+This gap between train and test loss reflects expected overfitting as boosting continues
+
+The black dashed vertical line marks the selected best iteration (105)
+
+The selected XGBoost model showed strong grouped cross-validation performance, with an overall accuracy of 95.1% and Cohen's kappa of 0.896
+learly above the no-information rate of 73.6%. 
+Most major cell types were classified with high sensitivity and precision, including B, BnT, CD4, CD8, DC, MacCD204, SMA, Treg, Tumor, undefined, and Vasculature
+
+The main weaker classes were Fibro, Igg, Neutrophil, and PMN_MDSC. 
+Fibro and PMN_MDSC showed high sensitivity but low precision, indicating that the model over-predicts these labels. 
+Igg and Neutrophil showed low sensitivity, meaning that a substantial fraction of true cells from these classes are missed. 
+These classes should therefore be interpreted with caution in downstream predictions.
+
+
+# final classifier
+
+```{r train-final-xgboost-model}
+# Train the final XGBoost model on all training cells using the best CV parameters.
+# CV is only used to select parameters; this model is the one used for held-out
+# test evaluation and later prediction on unlabelled cells.
+final_model <- xgboost::xgb.train(
+  params = params_best,
+  data = Xy,
+  nrounds = best_nrounds,
+  verbose = TRUE
+)
+
+```
+
+
+save final model via saveRDS
+
+```{r train-final-model, message = FALSE, eval = TRUE}
+# saveRDS(
+#   final_model,
+#   file = file.path(base_path, "classifier_xgboost.rds")
+# )
+```
+
+
+
+This uses:
+
+max_depth = 3
+eta = 0.1
+subsample = 0.8
+colsample_bytree = 0.8
+min_child_weight = 5
+nrounds = 108
+
+```{r xgboost-variable-importance, fig.height=8, fig.width=8}
+# final_model <- readRDS(
+#   file.path(base_path, "classifier_xgboost.rds")
+# )
+
+# Extract marker importance from the trained XGBoost model.
+# Gain reflects how much each marker contributed to reducing the loss.
+#xgb.importance(model = final_model,feature_names =c("SMA"))
+
+var_imp <- xgboost::xgb.importance(
+  feature_names = colnames(X),
+  model = final_model
+)
+
+var_imp |> 
+  slice_max(Gain, n = 20)
+
+var_imp_top <- var_imp |> 
+  dplyr::slice_max(Gain, n = 20) |> 
+  dplyr::mutate(
+    Feature = forcats::fct_reorder(Feature, Gain)
+  )
+
+```
+
+
+
+```{r variable-importance, fig.height=8, fig.width=8}
+ggplot(var_imp_top, aes(x = Gain, y = Feature)) +
+  geom_col(fill = "steelblue") +
+  theme_classic() +
+  labs(
+    title = "Top XGBoost Marker Importances",
+    x = "Gain",
+    y = "Marker"
+  )
+```
+
+
+
+Variable importance was assessed using XGBoost gain, which measures how much each marker contributes to reducing the model loss across tree splits. 
+The most informative markers were CD3, CD204, CD209, CD20, Lamp3, CD31, FOXP3, CD66b, and CD146. 
+These markers correspond well to the expected biology of the annotated cell types, including T cells, B cells, macrophage/DC populations, vasculature, neutrophil-like cells, and stromal compartments.
+
+This is a useful sanity check: the model is not relying on strange markers; it is using biologically meaningful features.
+
+# prepare test data
+
+```{r prepare-test-data}
+test_sce$cell_id <- paste0(
+  test_sce$sample_id,
+  "_",
+  test_sce$ObjectNumber
+)
+
+colnames(test_sce) <- test_sce$cell_id
+
+# Labelled cells only for evaluation
+test_eval_keep <- !is.na(test_sce$cell_labels) &
+  test_sce$cell_labels != "unlabelled" &
+  test_sce$cell_labels %in% label_mapping
+
+# Use the same marker set as training
+X_test <- t(assay(test_sce, "exprs")[marker_keep, test_eval_keep])
+
+# Check that train and test feature columns match
+stopifnot(identical(colnames(X), colnames(X_test)))
+
+# Convert test labels using the training label mapping
+y_test_true <- factor(
+  test_sce$cell_labels[test_eval_keep],
+  levels = label_mapping
+)
+
+y_test <- as.integer(y_test_true) - 1
+
+stopifnot(!anyNA(y_test))
+
+# Store labelled test data in XGBoost format
+Xy_test <- xgboost::xgb.DMatrix(
+  data = X_test,
+  label = y_test
+)
+
+Xy_test
+
+```
+
+## visualize predicted results
+
+```{r test-performance-check, fig.height=8, fig.width=12}
+
+raw_test_pred <- predict(final_model, newdata = Xy_test)
+
+# Try both possible reshaping directions
+test_prob_byrow <- matrix(
+  raw_test_pred,
+  ncol = num_classes,
+  byrow = TRUE
+)
+
+test_prob_bycol <- matrix(
+  raw_test_pred,
+  ncol = num_classes,
+  byrow = FALSE
+)
+
+# Check which one has probabilities summing to 1 per cell
+mean(abs(rowSums(test_prob_byrow) - 1))
+
+mean(abs(rowSums(test_prob_bycol) - 1))
+```
+
+```{r test-performance-final, fig.height=8, fig.width=12}
+if (
+  mean(abs(rowSums(test_prob_byrow) - 1)) <
+  mean(abs(rowSums(test_prob_bycol) - 1))
+) {
+  test_prob <- test_prob_byrow
+} else {
+  test_prob <- test_prob_bycol
+}
+
+stopifnot(nrow(test_prob) == sum(test_eval_keep))
+stopifnot(nrow(test_prob) == nrow(X_test))
+stopifnot(ncol(test_prob) == num_classes)
+stopifnot(mean(abs(rowSums(test_prob) - 1)) < 1e-6)
+
+rownames(test_prob) <- colnames(test_sce)[test_eval_keep]
+colnames(test_prob) <- label_mapping
+
+```
+
+```{r}
+test_pred <- factor(
+  label_mapping[max.col(test_prob, ties.method = "first")],
+  levels = label_mapping
+)
+
+test_idx <- match(
+  rownames(test_prob),
+  colnames(test_sce)
+)
+
+stopifnot(!anyNA(test_idx))
+
+test_true <- factor(
+  test_sce$cell_labels[test_idx],
+  levels = label_mapping
+)
+
+stopifnot(
+  length(test_pred) == length(test_true),
+  !anyNA(test_true)
+)
+
+cm_test <- caret::confusionMatrix(
+  data = test_pred,
+  reference = test_true
+)
+```
+
+
+```{r}
+cm_test$table
+```
+
+
+```{r}
+cm_test$overall
+```
+
+
+
+```{r test-performance, fig.height=8, fig.width=12}
+# Per-cell-type performance plot.
+test_perf <- data.frame(cm_test$byClass) |> 
+  dplyr::mutate(
+    class = sub("Class: ", "", rownames(cm_test$byClass)),
+    fpr = 1 - Specificity
+  )
+
+ggplot(test_perf) +
+  geom_point(
+    aes(
+      x = fpr,
+      y = Sensitivity,
+      size = Detection.Rate,
+      fill = class
+    ),
+    shape = 21,
+    color = "black",
+    alpha = 0.9
+  ) +
+  ggrepel::geom_text_repel(
+    aes(
+      x = fpr,
+      y = Sensitivity,
+      label = class
+    ),
+    size = 3,
+    max.overlaps = Inf,
+    min.segment.length = 0,
+    box.padding = 0.3,
+    point.padding = 0.2
+  ) +
+  scale_fill_manual(
+    values = metadata(spe_27)$colour_vectors$cell_types,
+    guide = "none"
+  ) +
+  scale_size(
+    range = c(1, 15),
+    guide = guide_legend(title.position = "top")
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "top",
+    legend.title = element_text(hjust = 0.5)
+  ) +
+  ylab("Sensitivity (TPR)") +
+  xlab("1 - Specificity (FPR)")
+```
+
+## Class-specific protein markers driving cell-type predictions
+
+```{r}
+shap_raw <- predict(
+  final_model,
+  newdata = xgboost::xgb.DMatrix(X_test),
+  predcontrib = TRUE
+)
+
+dim(shap_raw)
+```
+
+
+```{r class-specific-shap-setup}
+
+feature_names <- colnames(X_test)
+
+# Remove BIAS column from SHAP array
+shap_values <- shap_raw[, , 1:length(feature_names)]
+
+stopifnot(dim(shap_values)[1] == nrow(X_test))
+stopifnot(dim(shap_values)[2] == length(label_mapping))
+stopifnot(dim(shap_values)[3] == length(feature_names))
+
+# Function to extract top SHAP markers for one class
+get_class_shap <- function(class_name, top_n = 15) {
+  
+  class_id <- which(label_mapping == class_name)
+  
+  if (length(class_id) != 1) {
+    stop("Class not found in label_mapping: ", class_name)
+  }
+  
+  shap_class <- shap_values[, class_id, , drop = FALSE]
+  shap_class <- shap_class[, 1, ]
+  
+  out <- data.frame(
+    class = class_name,
+    marker = feature_names,
+    mean_abs_shap = apply(abs(shap_class), 2, mean),
+    mean_shap = apply(shap_class, 2, mean)
+  )
+  
+  out <- out |>
+    dplyr::arrange(dplyr::desc(mean_abs_shap)) |>
+    dplyr::slice_head(n = top_n)
+  
+  out
+}
+
+tumor_shap <- get_class_shap("Tumor", top_n = 15)
+fibro_shap <- get_class_shap("Fibro", top_n = 15)
+sma_shap   <- get_class_shap("SMA", top_n = 15)
+vcaf_shap  <- get_class_shap("vCAF", top_n = 15)
+
+tumor_shap
+fibro_shap
+sma_shap
+vcaf_shap
+```
+
+
+
+```{r class-specific-shap-true-cells}
+
+get_class_shap_true_cells <- function(class_name, top_n = 10) {
+  
+  class_id <- which(label_mapping == class_name)
+  
+  if (length(class_id) != 1) {
+    stop("Class not found in label_mapping: ", class_name)
+  }
+  
+  keep_cells <- test_true == class_name
+  
+  if (sum(keep_cells) == 0) {
+    stop("No test cells found for class: ", class_name)
+  }
+  
+  shap_class <- shap_values[keep_cells, class_id, , drop = FALSE]
+  shap_class <- shap_class[, 1, ]
+  
+  out <- data.frame(
+    class = class_name,
+    marker = feature_names,
+    mean_shap = apply(shap_class, 2, mean),
+    mean_abs_shap = apply(abs(shap_class), 2, mean)
+  )
+  
+  positive <- out |>
+    dplyr::filter(mean_shap > 0) |>
+    dplyr::arrange(dplyr::desc(mean_shap)) |>
+    dplyr::slice_head(n = top_n) |>
+    dplyr::mutate(direction = "positive")
+  
+  negative <- out |>
+    dplyr::filter(mean_shap < 0) |>
+    dplyr::arrange(mean_shap) |>
+    dplyr::slice_head(n = top_n) |>
+    dplyr::mutate(direction = "negative")
+  
+  dplyr::bind_rows(positive, negative)
+}
+
+shap_true_directional <- dplyr::bind_rows(
+  get_class_shap_true_cells("Tumor", top_n = 10),
+  get_class_shap_true_cells("Fibro", top_n = 10),
+  get_class_shap_true_cells("SMA", top_n = 10),
+  get_class_shap_true_cells("vCAF", top_n = 10)
+)
+
+shap_true_directional
+
+```
+
+
+```{r class-specific-shap-plot, fig.height=8, fig.width=12}
+shap_plot_df <- shap_true_directional |>
+  dplyr::filter(direction == "positive") |>
+  dplyr::group_by(class) |>
+  dplyr::slice_max(mean_shap, n = 8) |>
+  dplyr::ungroup()
+
+ggplot(
+  shap_plot_df,
+  aes(
+    x = reorder(marker, mean_shap),
+    y = mean_shap
+  )
+) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  facet_wrap(~ class, scales = "free_y") +
+  theme_bw(base_size = 13) +
+  xlab("Protein marker") +
+  ylab("Mean positive SHAP value") +
+  ggtitle("Class-specific protein markers driving XGBoost predictions")
+```
+
+## Interpretable protein-state map of XGBoost-predicted cell populations
+
+```{r protein-state-shap-map-publication, fig.height=7, fig.width=13}
+library(ggplot2)
+library(ggrepel)
+
+state_markers <- shap_true_directional |>
+  dplyr::filter(direction == "positive") |>
+  dplyr::group_by(class) |>
+  dplyr::slice_max(mean_shap, n = 6) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(
+    cell_state = dplyr::case_when(
+      class == "Tumor" ~ "Epithelial tumor state",
+      class == "Fibro" ~ "Podoplanin+ stromal state",
+      class == "SMA" ~ "Contractile myofibroblast state",
+      class == "vCAF" ~ "Vascular-associated CAF state",
+      TRUE ~ class
+    ),
+    marker_group = dplyr::case_when(
+      marker %in% c("Ecad", "panCK", "EGFR") ~ "Epithelial / tumor",
+      marker %in% c("SMA", "Podoplanin", "CD10", "CD73") ~ "Stromal / CAF",
+      marker %in% c("CD31", "CD146") ~ "Vascular / perivascular",
+      marker %in% c("CD45", "CD3", "CD20", "CD204", "CD209", "CD11c", "CD66b") ~ "Immune-associated",
+      TRUE ~ "Other"
+    ),
+    label_marker = ifelse(mean_shap > 0.25, marker, NA)
+  )
+
+ggplot(
+  state_markers,
+  aes(
+    x = marker,
+    y = cell_state,
+    size = mean_abs_shap,
+    fill = mean_shap
+  )
+) +
+  geom_point(shape = 21, color = "black", alpha = 0.9) +
+  ggrepel::geom_text_repel(
+    aes(label = label_marker),
+    size = 3.5,
+    na.rm = TRUE,
+    max.overlaps = Inf
+  ) +
+  facet_grid(. ~ marker_group, scales = "free_x", space = "free_x") +
+  scale_size(range = c(3, 13)) +
+  theme_bw(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right",
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "bold")
+  ) +
+  labs(
+    title = "Protein-state map of XGBoost-predicted cell populations",
+    subtitle = "Class-specific SHAP values identify protein programs driving cell-state prediction",
+    x = "Protein marker",
+    y = "Interpreted cell state",
+    size = "Mean |SHAP|",
+    fill = "Mean SHAP"
+  )
+```
+## XGBoost-derived protein-state architecture
+
+```{r shap-protein-state-architecture, fig.height=6, fig.width=10}
+library(ggplot2)
+
+# Build SHAP matrix: rows = cell states, columns = protein markers
+shap_state_matrix <- shap_true_directional |>
+  dplyr::group_by(class, marker) |>
+  dplyr::summarise(
+    mean_shap = mean(mean_shap),
+    .groups = "drop"
+  ) |>
+  tidyr::pivot_wider(
+    names_from = marker,
+    values_from = mean_shap,
+    values_fill = 0
+  )
+
+shap_state_long <- shap_state_matrix |>
+  tidyr::pivot_longer(
+    cols = -class,
+    names_to = "marker",
+    values_to = "mean_shap"
+  ) |>
+  dplyr::mutate(
+    class = factor(
+      class,
+      levels = c("Tumor", "Fibro", "SMA", "vCAF")
+    )
+  )
+
+ggplot(
+  shap_state_long,
+  aes(
+    x = marker,
+    y = class,
+    fill = mean_shap
+  )
+) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  scale_fill_gradient2(
+    low = "navy",
+    mid = "white",
+    high = "firebrick",
+    midpoint = 0
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  ) +
+  labs(
+    title = "XGBoost-derived protein-state architecture",
+    subtitle = "Positive and negative SHAP values reveal protein programs defining cell states",
+    x = "Protein marker",
+    y = "Cell state",
+    fill = "Mean SHAP"
+  )
+
+```
+
+## Phenotypic trajectory of stromal-to-tumor protein states
+
+```{r}
+library(scater)
+library(dplyr)
+
+set.seed(42)
+
+test_sce <- scater::runUMAP(
+  test_sce,
+  exprs_values = "exprs",
+  subset_row = feature_names,
+  name = "UMAP"
+)
+
+umap_df <- data.frame(
+  UMAP1 = reducedDim(test_sce, "UMAP")[, 1],
+  UMAP2 = reducedDim(test_sce, "UMAP")[, 2],
+  true_label = test_true,
+  pred_label = test_pred,
+  is_correct = test_true == test_pred
+)
+
+head(umap_df)
+```
+
+```{r xgboost_predicted_protein_defined_umap, fig.height=8.5, fig.width=12.5}
+
+library(ggplot2)
+library(dplyr)
+
+focus_classes <- c(
+  "Tumor", "Fibro", "SMA", "vCAF",
+  "Vasculature", "MacCD204", "CD4", "CD8"
+)
+
+state_order <- c(
+  "Tumor", "Fibro", "SMA", "vCAF",
+  "Vasculature", "MacCD204", "CD4", "CD8",
+  "Other predicted classes"
+)
+
+plot_df <- umap_df |>
+  mutate(
+    state_raw = ifelse(
+      pred_label %in% focus_classes,
+      as.character(pred_label),
+      "Other predicted classes"
+    ),
+    state_raw = factor(state_raw, levels = state_order)
+  )
+
+state_counts <- table(plot_df$state_raw)
+
+plot_df <- plot_df |>
+  mutate(
+    state = paste0(
+      state_raw,
+      " (n=",
+      state_counts[as.character(state_raw)],
+      ")"
+    ),
+    state = factor(
+      state,
+      levels = paste0(
+        state_order,
+        " (n=",
+        state_counts[state_order],
+        ")"
+      )
+    )
+  )
+
+state_colors <- setNames(
+  c(
+    "#E64B35",
+    "#00BFC4",
+    "#B65FCF",
+    "#FF1493",
+    "#1F78B4",
+    "#009E73",
+    "#253494",
+    "#FFD700",
+    "#C9C9C9"
+  ),
+  levels(plot_df$state)
+)
+
+get_dense_center <- function(df, k = 3) {
+
+  if (nrow(df) < 5) {
+    return(data.frame(
+      point_x = median(df$UMAP1),
+      point_y = median(df$UMAP2)
+    ))
+  }
+
+  set.seed(42)
+
+  km <- kmeans(
+    df[, c("UMAP1", "UMAP2")],
+    centers = min(k, nrow(df)),
+    nstart = 50
+  )
+
+  main_cluster <- as.integer(
+    names(which.max(table(km$cluster)))
+  )
+
+  df_main <- df[km$cluster == main_cluster, ]
+
+  data.frame(
+    point_x = median(df_main$UMAP1),
+    point_y = median(df_main$UMAP2)
+  )
+}
+
+label_df <- plot_df |>
+  filter(state_raw != "Other predicted classes") |>
+  group_by(state_raw) |>
+  group_modify(~ get_dense_center(.x)) |>
+  ungroup() |>
+  mutate(
+    label_x = case_when(
+      state_raw == "Tumor" ~ point_x + 0.2,
+      state_raw == "MacCD204" ~ point_x - 1.2,
+      state_raw == "Fibro" ~ point_x - 0.9,
+      state_raw == "SMA" ~ point_x - 0.4,
+      state_raw == "vCAF" ~ point_x - 0.8,
+      state_raw == "Vasculature" ~ point_x - 1.0,
+      state_raw == "CD4" ~ point_x + 0.8,
+      state_raw == "CD8" ~ point_x + 1.0,
+      TRUE ~ point_x + 0.4
+    ),
+    label_y = case_when(
+      state_raw == "Tumor" ~ point_y + 1.0,
+      state_raw == "MacCD204" ~ point_y + 0.7,
+      state_raw == "Fibro" ~ point_y - 0.1,
+      state_raw == "SMA" ~ point_y - 0.5,
+      state_raw == "vCAF" ~ point_y - 0.9,
+      state_raw == "Vasculature" ~ point_y - 1.1,
+      state_raw == "CD4" ~ point_y + 0.6,
+      state_raw == "CD8" ~ point_y - 0.8,
+      TRUE ~ point_y + 0.5
+    )
+  )
+
+ggplot() +
+
+  geom_point(
+    data = plot_df |> filter(state_raw == "Other predicted classes"),
+    aes(UMAP1, UMAP2, color = state),
+    size = 0.40,
+    alpha = 0.15,
+    stroke = 0
+  ) +
+
+  geom_point(
+    data = plot_df |> filter(state_raw == "Tumor"),
+    aes(UMAP1, UMAP2, color = state),
+    size = 0.50,
+    alpha = 0.55,
+    stroke = 0
+  ) +
+
+  geom_point(
+    data = plot_df |> filter(
+      !state_raw %in% c(
+        "Tumor",
+        "Other predicted classes"
+      )
+    ),
+    aes(UMAP1, UMAP2, color = state),
+    size = 1.55,
+    alpha = 0.97,
+    stroke = 0
+  ) +
+
+  geom_segment(
+    data = label_df,
+    aes(
+      x = label_x,
+      y = label_y,
+      xend = point_x,
+      yend = point_y
+    ),
+    linewidth = 0.30,
+    color = "grey35"
+  ) +
+
+  geom_text(
+    data = label_df,
+    aes(
+      x = label_x,
+      y = label_y,
+      label = state_raw
+    ),
+    size = 4.2,
+    fontface = "bold",
+    color = "black"
+  ) +
+
+  scale_color_manual(
+    values = state_colors,
+    drop = FALSE
+  ) +
+
+  guides(
+    color = guide_legend(
+      override.aes = list(
+        size = 4.8,
+        alpha = 1
+      )
+    )
+  ) +
+
+  coord_equal() +
+
+  theme_bw(base_size = 13) +
+
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      size = 16
+    ),
+    plot.subtitle = element_text(
+      size = 12
+    ),
+    legend.position = "right",
+    legend.title = element_text(
+      face = "bold",
+      size = 12
+    ),
+    legend.text = element_text(
+      size = 9.3
+    ),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(
+      linewidth = 0.22,
+      color = "grey91"
+    )
+  ) +
+
+  labs(
+    title = "UMAP of XGBoost-predicted protein-defined cell states",
+    subtitle = "Predicted protein-defined cell states; major states highlighted",
+    color = "Cell state",
+    x = "UMAP1",
+    y = "UMAP2"
+  )
+
+```
+
+
+## XGBoost classification errors reveal biologically related cell states
+
+```{r xgboost-confusion-matrix-publication, fig.height=8, fig.width=10}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(forcats)
+
+# Confusion matrix from held-out test set
+cm_mat <- as.matrix(cm_test$table)
+
+# Convert counts to column percentages:
+# each column = true/reference class
+cm_prop <- prop.table(cm_mat, margin = 2) * 100
+
+cm_df <- as.data.frame(cm_prop) |>
+  dplyr::rename(
+    predicted = Prediction,
+    reference = Reference,
+    percent = Freq
+  ) |>
+  dplyr::mutate(
+    is_correct = predicted == reference,
+    label = ifelse(percent >= 1, sprintf("%.1f", percent), "")
+  )
+
+ggplot(
+  cm_df,
+  aes(
+    x = reference,
+    y = predicted,
+    fill = percent
+  )
+) +
+  geom_tile(color = "white", linewidth = 0.25) +
+  geom_text(
+    aes(label = label),
+    size = 2.6,
+    color = "black"
+  ) +
+  scale_fill_gradient(
+    low = "white",
+    high = "#2166AC"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank(),
+    legend.position = "right"
+  ) +
+  labs(
+    title = "XGBoost confusion matrix on held-out test set",
+    subtitle = "Column-normalized percentages show how true cell states were classified",
+    x = "True cell state",
+    y = "Predicted cell state",
+    fill = "% of true class"
+  )
+
+```
+
+
+
+```{r xgboost-error-map-biological-confusions, fig.height=6, fig.width=9}
+error_df <- cm_df |>
+  dplyr::filter(predicted != reference, percent > 0) |>
+  dplyr::arrange(dplyr::desc(percent)) |>
+  dplyr::slice_head(n = 20) |>
+  dplyr::mutate(
+    confusion = paste0(reference, " → ", predicted),
+    confusion = forcats::fct_reorder(confusion, percent)
+  )
+
+ggplot(
+  error_df,
+  aes(
+    x = percent,
+    y = confusion,
+    fill = percent
+  )
+) +
+  geom_col(color = "black", linewidth = 0.2) +
+  scale_fill_gradient(
+    low = "grey85",
+    high = "#B2182B"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    legend.position = "none"
+  ) +
+  labs(
+    title = "Dominant XGBoost classification errors",
+    subtitle = "Misclassifications highlight rare or phenotypically related cell states",
+    x = "% of true class misclassified",
+    y = "True → predicted cell state"
+  )
+```
+
+```{r check-rare-class-errors}
+# Absolute number of true cells per class in the test set
+test_class_counts <- colSums(cm_test$table)
+
+sort(test_class_counts)
+
+```
+
+
+```{r check-igg-bnt-errors}
+# Absolute confusion counts for small classes
+cm_test$table[, c("Igg", "BnT")]
+
+# Percent confusion for the same classes
+round(prop.table(cm_test$table, margin = 2)[, c("Igg", "BnT")] * 100, 1)
+```
+
+## Spatial neighborhood analysis of XGBoost-predicted cell states
+
+```{r}
+## Build spatial coordinates object
+
+spe_coords <- as.data.frame(spatialCoords(spe))
+
+spe_coords$cell_id <- colnames(spe)
+
+coords <- data.frame(
+  cell_id = colnames(test_sce),
+  sample_id = as.character(test_sce$sample_id),
+  ObjectNumber = as.character(test_sce$ObjectNumber),
+  pred_label = as.character(test_pred),
+  true_label = as.character(test_true),
+  stringsAsFactors = FALSE
+)
+
+coords <- coords |>
+  dplyr::left_join(
+    spe_coords |> dplyr::select(cell_id, Pos_X, Pos_Y),
+    by = "cell_id"
+  ) |>
+  dplyr::rename(
+    x = Pos_X,
+    y = Pos_Y
+  )
+
+head(coords)
+dim(coords)
+sum(is.na(coords$x))
+sum(is.na(coords$y))
+str(coords)
+```
+
+
+```{r}
+sum(is.na(coords$x))
+# 0
+
+sum(is.na(coords$y))
+# 0
+```
+
+```{r}
+spatial_pred_df <- coords
+
+head(spatial_pred_df)
+dim(spatial_pred_df)
+```
+
+
+```{r}
+class(spatial_pred_df)
+dim(spatial_pred_df)
+head(spatial_pred_df)
+```
+
+```{r}
+colnames(spatial_pred_df)
+```
+
+
+```{r}
+summary(spatial_pred_df$x)
+summary(spatial_pred_df$y)
+```
+
+```{r}
+library(ggplot2)
+
+ggplot(spatial_pred_df,
+       aes(x = x, y = y, color = pred_label)) +
+  geom_point(size = 0.3, alpha = 0.7) +
+  theme_bw()
+```
+
+
+```{r}
+focus_classes <- c(
+  "Tumor","Fibro","SMA","vCAF",
+  "Vasculature","MacCD204","CD4","CD8"
+)
+
+plot_df <- spatial_pred_df
+
+plot_df$group <- ifelse(
+  plot_df$pred_label %in% focus_classes,
+  plot_df$pred_label,
+  "Other"
+)
+
+ggplot(plot_df,
+       aes(x = x, y = y, color = group)) +
+  geom_point(size = 0.25, alpha = 0.8) +
+  coord_fixed() +
+  theme_bw(base_size = 14) +
+  labs(
+    title = "Spatial organization of XGBoost-predicted cell states",
+    x = "X coordinate",
+    y = "Y coordinate",
+    color = "Cell state"
+  )
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+focus_classes <- c(
+  "Tumor", "Fibro", "SMA", "vCAF",
+  "Vasculature", "MacCD204", "CD4", "CD8"
+)
+
+top_samples <- spatial_pred_df |>
+  count(sample_id, sort = TRUE) |>
+  slice_head(n = 6) |>
+  pull(sample_id)
+
+spatial_plot_df <- spatial_pred_df |>
+  filter(sample_id %in% top_samples) |>
+  mutate(
+    cell_state = ifelse(
+      pred_label %in% focus_classes,
+      pred_label,
+      "Other"
+    )
+  )
+
+ggplot(spatial_plot_df, aes(x = x, y = y, color = cell_state)) +
+  geom_point(size = 0.35, alpha = 0.85) +
+  coord_fixed() +
+  facet_wrap(~ sample_id, ncol = 3) +
+
+  guides(
+    color = guide_legend(
+      override.aes = list(
+        size = 3,
+        alpha = 1
+      )
+    )
+  ) +
+
+  theme_bw(base_size = 11) +
+
+  theme(
+    legend.position = "right",
+    legend.title = element_text(face = "bold", size = 8),
+    legend.text = element_text(size = 7),
+
+    strip.text = element_text(
+      size = 5,
+      face = "bold"
+    ),
+
+    panel.grid = element_blank()
+  ) +
+
+  labs(
+    title = "Spatial distribution of XGBoost-predicted cell states",
+    subtitle = "Representative tissue images shown separately",
+    x = "X coordinate",
+    y = "Y coordinate",
+    color = "Cell state"
+  )
+```
+
+
+## Random Forest validation of cell-state annotation 
+## Independent Random Forest validation of protein-defined cell states
+
+```{r random-forest-prepare-data}
+set.seed(42)
+
+rf_train_df <- as.data.frame(X)
+rf_train_df$cell_label <- y_true
+
+rf_test_df <- as.data.frame(X_test)
+rf_test_df$cell_label <- y_test_true
+
+table(rf_train_df$cell_label)
+table(rf_test_df$cell_label)
+
+```
+
+```{r train-random-forest-model}
+set.seed(42)
+
+rf_model <- randomForest(
+  cell_label ~ .,
+  data = rf_train_df,
+  ntree = 500,
+  mtry = floor(sqrt(ncol(X))),
+  importance = TRUE
+)
+
+rf_model
+```
+
+
+```{r random-forest-test-performance}
+rf_test_pred <- predict(
+  rf_model,
+  newdata = rf_test_df,
+  type = "response"
+)
+
+rf_test_pred <- factor(rf_test_pred, levels = label_mapping)
+rf_test_true <- factor(rf_test_df$cell_label, levels = label_mapping)
+
+cm_rf_test <- caret::confusionMatrix(
+  data = rf_test_pred,
+  reference = rf_test_true
+)
+
+cm_rf_test$table
+cm_rf_test$overall
+```
+
+
+```{r random-forest-by-class-performance}
+cm_rf_test$byClass
+```
+
+
+```{r random-forest-marker-importance, fig.height=8, fig.width=8}
+rf_importance <- importance(rf_model)
+
+rf_importance_df <- data.frame(
+  marker = rownames(rf_importance),
+  MeanDecreaseGini = rf_importance[, "MeanDecreaseGini"],
+  row.names = NULL
+) |>
+  dplyr::arrange(desc(MeanDecreaseGini)) |>
+  dplyr::slice_head(n = 20)
+
+ggplot(
+  rf_importance_df,
+  aes(
+    x = MeanDecreaseGini,
+    y = reorder(marker, MeanDecreaseGini)
+  )
+) +
+  geom_col(fill = "steelblue") +
+  theme_classic(base_size = 13) +
+  labs(
+    title = "Top Random Forest marker importances",
+    x = "Mean decrease Gini",
+    y = "Marker"
+  )
+```
+
+## Biological interpretation of classification errors
+
+```{r}
+## Biological stromal continuum: Fibro - vCAF - SMA
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(tibble)
+
+marker_expr <- t(as.matrix(assay(spe, "exprs")))
+
+marker_df <- as.data.frame(marker_expr) |>
+  rownames_to_column("cell_id")
+
+meta_df <- as.data.frame(colData(spe)) |>
+  rownames_to_column("cell_id")
+
+label_df <- as.data.frame(colData(lab_sce)) |>
+  rownames_to_column("cell_id") |>
+  select(cell_id, cell_labels)
+
+bio_df <- meta_df |>
+  left_join(marker_df, by = "cell_id") |>
+  left_join(label_df, by = "cell_id") |>
+  mutate(pred_label = cell_labels) |>
+  filter(!is.na(pred_label))
+
+stromal_markers <- c("SMA", "Podoplanin", "CD146")
+
+bio_df |>
+  filter(pred_label %in% c("Fibro", "vCAF", "SMA")) |>
+  select(pred_label, all_of(stromal_markers)) |>
+  pivot_longer(
+    cols = all_of(stromal_markers),
+    names_to = "marker",
+    values_to = "expression"
+  ) |>
+  ggplot(aes(x = pred_label, y = expression, fill = pred_label)) +
+  geom_violin(trim = FALSE, alpha = 0.75) +
+  geom_boxplot(width = 0.12, outlier.size = 0.4, alpha = 0.85) +
+  facet_wrap(~ marker, scales = "free_y") +
+  theme_bw(base_size = 13) +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    title = "Fibro–vCAF–SMA continuum",
+    subtitle = "Stromal populations show related marker profiles, explaining model confusion",
+    x = "Predicted cell state",
+    y = "Marker expression"
+  )
+```
+```{r}
+## Biological validation of immune-related classification overlaps
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+## 1. PMN_MDSC versus Neutrophil
+## These populations are expected to share granulocytic/myeloid markers.
+
+myeloid_overlap_markers <- c(
+  "CD66b",
+  "CD11b",
+  "Arg1",
+  "CD15",
+  "CXCL8"
+)
+
+bio_df |>
+  filter(pred_label %in% c("PMN_MDSC", "Neutrophil")) |>
+  select(pred_label, all_of(myeloid_overlap_markers)) |>
+  pivot_longer(
+    cols = all_of(myeloid_overlap_markers),
+    names_to = "marker",
+    values_to = "expression"
+  ) |>
+  ggplot(
+    aes(
+      x = pred_label,
+      y = expression,
+      fill = pred_label
+    )
+  ) +
+  geom_violin(
+    trim = FALSE,
+    alpha = 0.75
+  ) +
+  geom_boxplot(
+    width = 0.12,
+    outlier.size = 0.4,
+    alpha = 0.85
+  ) +
+  facet_wrap(
+    ~ marker,
+    scales = "free_y"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    title = "PMN-MDSC and neutrophil marker overlap",
+    subtitle = "Granulocytic/myeloid marker profiles explain partial model confusion",
+    x = "Predicted cell state",
+    y = "Marker expression"
+  )
+```
+```{r}
+## 2. NK versus CD8 T cells
+## These populations may overlap through cytotoxic/lymphoid marker expression.
+
+nk_cd8_markers <- c(
+  "CD3",
+  "CD8a",
+  "NKG2A",
+  "CD56",
+  "EOMES",
+  "Tbet"
+)
+
+bio_df |>
+  filter(pred_label %in% c("NK", "CD8")) |>
+  select(pred_label, all_of(nk_cd8_markers)) |>
+  pivot_longer(
+    cols = all_of(nk_cd8_markers),
+    names_to = "marker",
+    values_to = "expression"
+  ) |>
+  ggplot(
+    aes(
+      x = pred_label,
+      y = expression,
+      fill = pred_label
+    )
+  ) +
+  geom_violin(
+    trim = FALSE,
+    alpha = 0.75
+  ) +
+  geom_boxplot(
+    width = 0.12,
+    outlier.size = 0.4,
+    alpha = 0.85
+  ) +
+  facet_wrap(
+    ~ marker,
+    scales = "free_y"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    title = "NK and CD8 T-cell marker overlap",
+    subtitle = "Shared cytotoxic/lymphoid markers explain partial model confusion",
+    x = "Predicted cell state",
+    y = "Marker expression"
+  )
+```
+
+
+```{r}
+## Summary table: mean marker expression by selected related cell states
+
+related_classes <- c(
+  "Fibro", "vCAF", "SMA",
+  "PMN_MDSC", "Neutrophil",
+  "NK", "CD8"
+)
+
+related_markers <- c(
+  "SMA", "Podoplanin", "CD146",
+  "CD66b", "CD11b", "Arg1", "CD15", "CXCL8",
+  "CD3", "CD8a", "NKG2A", "CD56", "EOMES", "Tbet"
+)
+
+bio_marker_summary <- bio_df |>
+  filter(pred_label %in% related_classes) |>
+  group_by(pred_label) |>
+  summarise(
+    across(
+      all_of(related_markers),
+      ~ mean(.x, na.rm = TRUE)
+    ),
+    n_cells = dplyr::n(),
+    .groups = "drop"
+  )
+
+bio_marker_summary
+```
+## Disease-relevant cell state–marker network
+
+```{r}
+## Beautiful biological disease-link network
+## cell states -> markers -> biological processes -> diseases
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(igraph)
+library(ggraph)
+library(ggplot2)
+library(scales)
+library(ggrepel)
+
+marker_expr <- t(as.matrix(assay(spe, "exprs")))
+
+marker_df <- as.data.frame(marker_expr) |>
+  rownames_to_column("cell_id")
+
+meta_df <- as.data.frame(colData(spe)) |>
+  rownames_to_column("cell_id")
+
+label_df <- as.data.frame(colData(lab_sce)) |>
+  rownames_to_column("cell_id") |>
+  select(cell_id, cell_labels)
+
+bio_df <- meta_df |>
+  left_join(marker_df, by = "cell_id") |>
+  left_join(label_df, by = "cell_id") |>
+  mutate(pred_label = cell_labels) |>
+  filter(!is.na(pred_label))
+
+bio_links <- tibble::tribble(
+  ~cell_state, ~marker, ~process, ~disease, ~module,
+
+  "Tumor", "panCK", "Epithelial tumor identity", "Carcinoma", "Tumor",
+  "Tumor", "Ecad",  "Epithelial adhesion", "Carcinoma", "Tumor",
+  "Tumor", "EGFR",  "Growth factor signaling", "EGFR-driven cancer", "Tumor",
+  "Tumor", "Ki67",  "Cell proliferation", "Aggressive tumor growth", "Tumor",
+  "Tumor", "p53",   "DNA damage / tumor stress", "Tumor progression", "Tumor",
+
+  "Fibro", "SMA",        "Fibroblast activation", "Cancer-associated fibroblasts", "Stroma",
+  "Fibro", "Podoplanin", "Stromal activation", "Invasion / metastasis", "Stroma",
+  "Fibro", "MMP9",       "Matrix degradation", "Invasion / metastasis", "Stroma",
+
+  "SMA", "SMA",        "Activated stroma", "Fibrosis-like remodeling", "Stroma",
+  "SMA", "CD146",      "Vascular stromal niche", "Tumor angiogenesis", "Stroma",
+  "vCAF", "CD146",     "Vascular CAF program", "Tumor angiogenesis", "Stroma",
+  "vCAF", "Podoplanin", "CAF remodeling", "Invasion / metastasis", "Stroma",
+
+  "Mac", "CD11b",  "Myeloid infiltration", "Chronic inflammation", "Myeloid",
+  "Mac", "CD204",  "Suppressive macrophages", "Tumor immune evasion", "Myeloid",
+  "Mac", "CD11c",  "Antigen-presenting myeloid cells", "Inflammatory tumor niche", "Myeloid",
+
+  "MacCD204", "CD204", "M2-like macrophages", "Tumor immune evasion", "Myeloid",
+  "MacCD204", "Arg1",  "Arginine metabolism / suppression", "Immunosuppression", "Myeloid",
+  "MacCD204", "CD11b", "Myeloid suppressive niche", "Immunosuppression", "Myeloid",
+
+  "PMN_MDSC", "CD66b", "Granulocytic MDSC", "Immunosuppression", "Myeloid",
+  "PMN_MDSC", "Arg1",  "T-cell suppression", "Tumor immune evasion", "Myeloid",
+  "PMN_MDSC", "CXCL8", "Neutrophil recruitment / inflammation", "Inflammatory cancer", "Myeloid",
+
+  "Neutrophil", "CD15",  "Neutrophil program", "Inflammatory cancer", "Myeloid",
+  "Neutrophil", "CD66b", "Granulocytic inflammation", "Inflammatory cancer", "Myeloid",
+  "Neutrophil", "CXCL8", "CXCL8-driven inflammation", "Tumor angiogenesis", "Myeloid",
+
+  "CD4", "CD3",  "T-cell immunity", "Anti-tumor immune response", "Lymphoid",
+  "CD4", "CD45", "Immune cell infiltration", "Inflammatory tumor niche", "Lymphoid",
+
+  "CD8", "CD3",  "Cytotoxic T-cell immunity", "Anti-tumor immune response", "Lymphoid",
+  "CD8", "CD8a", "Cytotoxic killing", "Anti-tumor immune response", "Lymphoid",
+  "CD8", "PD1",  "T-cell exhaustion", "Immune checkpoint exhaustion", "Lymphoid",
+
+  "Treg", "FOXP3", "Regulatory T-cell program", "Tumor immune evasion", "Lymphoid",
+  "Treg", "GITR",  "Treg activation", "Immunosuppression", "Lymphoid",
+  "Treg", "CD3",   "Regulatory lymphoid niche", "Tumor immune evasion", "Lymphoid",
+
+  "NK", "CD56",  "NK-cell cytotoxicity", "Anti-tumor immune response", "Lymphoid",
+  "NK", "NKG2A", "NK inhibitory signaling", "Immune checkpoint exhaustion", "Lymphoid",
+  "NK", "EOMES", "NK differentiation", "Anti-tumor immune response", "Lymphoid",
+  "NK", "Tbet",  "Cytotoxic lymphoid program", "Anti-tumor immune response", "Lymphoid"
+)
+
+available_markers <- intersect(
+  unique(bio_links$marker),
+  colnames(bio_df)
+)
+
+marker_means <- bio_df |>
+  group_by(pred_label) |>
+  summarise(
+    across(
+      all_of(available_markers),
+      ~ mean(.x, na.rm = TRUE)
+    ),
+    .groups = "drop"
+  ) |>
+  pivot_longer(
+    cols = all_of(available_markers),
+    names_to = "marker",
+    values_to = "mean_expression"
+  ) |>
+  rename(cell_state = pred_label)
+
+network_df <- bio_links |>
+  filter(marker %in% available_markers) |>
+  left_join(marker_means, by = c("cell_state", "marker")) |>
+  filter(!is.na(mean_expression)) |>
+  filter(mean_expression > 0) |>
+  mutate(
+    marker_node  = paste0("Marker: ", marker),
+    process_node = paste0("Process: ", process),
+    disease_node = paste0("Disease: ", disease),
+    module_node  = paste0("Module: ", module)
+  )
+
+edges_module_cell <- network_df |>
+  distinct(module_node, cell_state, module) |>
+  transmute(
+    from = module_node,
+    to = cell_state,
+    weight = 1.5,
+    edge_type = "module_lace",
+    module = module
+  )
+
+edges_cell_marker <- network_df |>
+  transmute(
+    from = cell_state,
+    to = marker_node,
+    weight = rescale(mean_expression, to = c(0.5, 2.2)),
+    edge_type = "expression",
+    module = module
+  )
+
+edges_marker_process <- network_df |>
+  distinct(marker_node, process_node, module) |>
+  transmute(
+    from = marker_node,
+    to = process_node,
+    weight = 0.65,
+    edge_type = "biology",
+    module = module
+  )
+
+edges_process_disease <- network_df |>
+  distinct(process_node, disease_node, module) |>
+  transmute(
+    from = process_node,
+    to = disease_node,
+    weight = 0.9,
+    edge_type = "disease_link",
+    module = module
+  )
+
+edges_disease_lace <- network_df |>
+  distinct(disease_node, module) |>
+  group_by(module) |>
+  summarise(nodes = list(unique(disease_node)), .groups = "drop") |>
+  rowwise() |>
+  mutate(edge_tbl = list(
+    if (length(nodes) >= 2) {
+      as.data.frame(t(combn(nodes, 2)))
+    } else {
+      data.frame(V1 = character(), V2 = character())
+    }
+  )) |>
+  ungroup() |>
+  unnest(edge_tbl) |>
+  transmute(
+    from = V1,
+    to = V2,
+    weight = 0.18,
+    edge_type = "disease_lace",
+    module = module
+  )
+
+edges <- bind_rows(
+  edges_module_cell,
+  edges_cell_marker,
+  edges_marker_process,
+  edges_process_disease,
+  edges_disease_lace
+) |>
+  distinct(from, to, module, edge_type, .keep_all = TRUE)
+
+module_lookup <- bio_links |>
+  select(cell_state, marker, process, disease, module) |>
+  pivot_longer(
+    cols = c(cell_state, marker, process, disease),
+    names_to = "kind",
+    values_to = "label"
+  ) |>
+  distinct(label, module)
+
+nodes <- tibble(name = unique(c(edges$from, edges$to))) |>
+  mutate(
+    label = case_when(
+      grepl("^Marker: ", name)  ~ sub("^Marker: ", "", name),
+      grepl("^Process: ", name) ~ sub("^Process: ", "", name),
+      grepl("^Disease: ", name) ~ sub("^Disease: ", "", name),
+      grepl("^Module: ", name)  ~ sub("^Module: ", "", name),
+      TRUE ~ name
+    ),
+    node_type = case_when(
+      grepl("^Module: ", name)  ~ "Biological module",
+      grepl("^Marker: ", name)  ~ "Marker",
+      grepl("^Process: ", name) ~ "Biological process",
+      grepl("^Disease: ", name) ~ "Disease / pathology",
+      TRUE ~ "Cell state"
+    )
+  ) |>
+  left_join(module_lookup, by = "label") |>
+  mutate(
+    module = case_when(
+      node_type == "Biological module" ~ label,
+      is.na(module) ~ "Other",
+      TRUE ~ module
+    ),
+    node_size = case_when(
+      node_type == "Biological module" ~ 18,
+      node_type == "Disease / pathology" ~ 10,
+      node_type == "Cell state" ~ 8,
+      node_type == "Biological process" ~ 5.5,
+      node_type == "Marker" ~ 3.2,
+      TRUE ~ 3
+    ),
+    label_size = case_when(
+      node_type == "Biological module" ~ 4.2,
+      node_type == "Disease / pathology" ~ 3.0,
+      node_type == "Cell state" ~ 2.8,
+      node_type == "Biological process" ~ 2.2,
+      node_type == "Marker" ~ 1.8,
+      TRUE ~ 2
+    ),
+    show_label = case_when(
+      node_type %in% c("Biological module", "Disease / pathology", "Cell state") ~ TRUE,
+      node_type == "Biological process" ~ TRUE,
+      node_type == "Marker" ~ TRUE,
+      TRUE ~ FALSE
+    )
+  ) |>
+  distinct(name, .keep_all = TRUE)
+
+graph_obj <- graph_from_data_frame(
+  d = edges,
+  vertices = nodes,
+  directed = FALSE
+)
+
+set.seed(777)
+
+layout_df <- create_layout(
+  graph_obj,
+  layout = "fr",
+  niter = 12000,
+  weights = E(graph_obj)$weight
+)
+
+module_colors <- c(
+  "Tumor" = "#D84A9A",
+  "Stroma" = "#00A6D6",
+  "Myeloid" = "#00A878",
+  "Lymphoid" = "#4F63B6",
+  "Other" = "#BDBDBD"
+)
+
+p <- ggraph(layout_df) +
+  geom_edge_arc(
+    aes(
+      width = weight,
+      color = module,
+      alpha = edge_type
+    ),
+    strength = 0.18,
+    lineend = "round",
+    show.legend = FALSE
+  ) +
+  geom_node_point(
+    aes(
+      size = node_size,
+      fill = module
+    ),
+    shape = 21,
+    color = "white",
+    stroke = 0.55,
+    alpha = 0.96
+  ) +
+  geom_node_text(
+    data = layout_df |> filter(show_label),
+    aes(
+      label = label,
+      size = label_size
+    ),
+    repel = TRUE,
+    color = "grey10",
+    max.overlaps = Inf,
+    point.padding = 0.12,
+    box.padding = 0.22,
+    segment.alpha = 0.18,
+    segment.size = 0.15
+  ) +
+  scale_fill_manual(values = module_colors) +
+  scale_edge_color_manual(values = module_colors) +
+  scale_size_identity() +
+  scale_edge_width(range = c(0.05, 1.6)) +
+  scale_edge_alpha_manual(
+    values = c(
+      "module_lace" = 0.08,
+      "expression" = 0.32,
+      "biology" = 0.20,
+      "disease_link" = 0.26,
+      "disease_lace" = 0.08
+    )
+  ) +
+  coord_equal(clip = "off") +
+  theme_void(base_size = 12) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(face = "bold", size = 21, hjust = 0.5),
+    plot.subtitle = element_text(size = 11.5, hjust = 0.5),
+    plot.margin = ggplot2::margin(20, 30, 20, 30)
+  ) +
+  labs(
+    title = "Cell state–marker–disease association network",
+    subtitle = "Tumor, stromal, myeloid and lymphoid programs linked to disease-like biological pathology",
+    fill = "Biological module"
+  )
+
+print(p)
+
+if (!exists("fig_dir")) {
+  fig_dir <- getwd()
+}
+
+ggsave(
+  filename = file.path(fig_dir, "beautiful_cell_state_marker_disease_network.png"),
+  plot = p,
+  width = 12,
+  height = 10,
+  dpi = 320,
+  bg = "white"
+)
+```
+```{r}
+## Disease association heatmap
+## cell states vs disease-like pathology
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(scales)
+
+available_markers <- intersect(
+  unique(bio_links$marker),
+  colnames(bio_df)
+)
+
+marker_means <- bio_df |>
+  group_by(pred_label) |>
+  summarise(
+    across(
+      all_of(available_markers),
+      ~ mean(.x, na.rm = TRUE)
+    ),
+    .groups = "drop"
+  ) |>
+  pivot_longer(
+    cols = all_of(available_markers),
+    names_to = "marker",
+    values_to = "mean_expression"
+  ) |>
+  rename(cell_state = pred_label)
+
+disease_activity <- bio_links |>
+  filter(marker %in% available_markers) |>
+  left_join(marker_means, by = c("cell_state", "marker")) |>
+  filter(!is.na(mean_expression)) |>
+  group_by(cell_state, disease, module) |>
+  summarise(
+    disease_score = mean(mean_expression, na.rm = TRUE),
+    n_markers = n_distinct(marker),
+    markers = paste(unique(marker), collapse = ", "),
+    .groups = "drop"
+  ) |>
+  mutate(
+    disease_score_scaled = rescale(disease_score, to = c(0, 1))
+  )
+
+p_heatmap <- ggplot(
+  disease_activity,
+  aes(
+    x = cell_state,
+    y = disease,
+    fill = disease_score_scaled
+  )
+) +
+  geom_tile(
+    color = "white",
+    linewidth = 0.6,
+    alpha = 0.95
+  ) +
+  geom_point(
+    aes(size = n_markers),
+    shape = 21,
+    fill = "white",
+    color = "grey25",
+    stroke = 0.4,
+    alpha = 0.8
+  ) +
+  facet_grid(
+    module ~ .,
+    scales = "free_y",
+    space = "free_y"
+  ) +
+  scale_fill_gradient(
+    low = "#F7FBFF",
+    high = "#08306B",
+    name = "Disease\nassociation\nscore"
+  ) +
+  scale_size_continuous(
+    range = c(2, 6),
+    name = "Number of\nmarkers"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    strip.text.y = element_text(face = "bold", size = 11),
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    axis.text.y = element_text(size = 9),
+    plot.title = element_text(face = "bold", size = 18),
+    plot.subtitle = element_text(size = 11),
+    legend.position = "right"
+  ) +
+  labs(
+    title = "Disease-like biological pathology across cell states",
+    subtitle = "Heatmap shows marker-based disease association score for each cell state",
+    x = "Cell state",
+    y = "Disease / pathology"
+  )
+
+print(p_heatmap)
+
+ggsave(
+  filename = file.path(fig_dir, "disease_pathology_heatmap_cell_states.png"),
+  plot = p_heatmap,
+  width = 11,
+  height = 8,
+  dpi = 320,
+  bg = "white"
+)
+```
+```{r}
+hallmark_links <- tibble::tribble(
+  ~marker,      ~hallmark,
+
+  # Tumor
+  "Ki67",       "Proliferation",
+  "EGFR",       "Growth signaling",
+  "p53",        "DNA damage response",
+  "panCK",      "Epithelial identity",
+  "Ecad",       "Cell adhesion",
+
+  # Stroma
+  "SMA",        "ECM remodeling",
+  "Podoplanin", "ECM remodeling",
+  "MMP9",       "Invasion / EMT",
+  "CD146",      "Angiogenesis",
+
+  # Myeloid
+  "CD11b",      "Myeloid infiltration",
+  "CD204",      "Immunosuppression",
+  "Arg1",       "Immunosuppression",
+  "CXCL8",      "Inflammation",
+  "CD66b",      "Inflammation",
+  "CD15",       "Inflammation",
+  "CD11c",      "Antigen presentation",
+
+  # Lymphoid
+  "CD3",        "T-cell immunity",
+  "CD8a",       "Cytotoxicity",
+  "PD1",        "Immune exhaustion",
+  "FOXP3",      "Treg suppression",
+  "GITR",       "Treg suppression",
+  "NKG2A",      "Immune exhaustion",
+  "CD56",       "NK cytotoxicity",
+  "EOMES",      "NK differentiation",
+  "Tbet",       "NK differentiation"
+)
+```
+
+
+```{r}
+hallmark_df <- marker_means |>
+  inner_join(hallmark_links, by = "marker") |>
+  group_by(cell_state, hallmark) |>
+  summarise(
+    score = mean(mean_expression, na.rm = TRUE),
+    n_markers = n(),
+    .groups = "drop"
+  )
+```
+
+
+```{r}
+hallmark_df <- hallmark_df |>
+  group_by(hallmark) |>
+  mutate(
+    zscore = as.numeric(scale(score))
+  ) |>
+  ungroup()
+```
+
+```{r}
+hallmark_order <- c(
+  "Proliferation",
+  "Growth signaling",
+  "DNA damage response",
+  "Epithelial identity",
+  "Cell adhesion",
+  "ECM remodeling",
+  "Invasion / EMT",
+  "Angiogenesis",
+  "Myeloid infiltration",
+  "Inflammation",
+  "Immunosuppression",
+  "Antigen presentation",
+  "T-cell immunity",
+  "Cytotoxicity",
+  "Immune exhaustion",
+  "Treg suppression",
+  "NK cytotoxicity",
+  "NK differentiation"
+)
+
+hallmark_df$hallmark <- factor(
+  hallmark_df$hallmark,
+  levels = rev(hallmark_order)
+)
+```
+
+```{r}
+marker_order <- marker_means |>
+  group_by(marker) |>
+  summarise(
+    mean_signal = mean(mean_expression, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(mean_signal) |>
+  pull(marker)
+
+marker_df_plot <- marker_means |>
+  group_by(marker) |>
+  mutate(
+    zscore = as.numeric(scale(mean_expression))
+  ) |>
+  ungroup()
+
+marker_df_plot$marker <- factor(
+  marker_df_plot$marker,
+  levels = marker_order
+)
+```
+
+```{r}
+library(ggplot2)
+
+p <- ggplot(
+  marker_df_plot,
+  aes(
+    x = cell_state,
+    y = marker,
+    fill = zscore
+  )
+) +
+  geom_tile(
+    color = "white",
+    linewidth = 0.6
+  ) +
+  geom_text(
+    aes(label = round(mean_expression, 1)),
+    size = 2.3
+  ) +
+  scale_fill_gradient2(
+    low = "#2166AC",
+    mid = "white",
+    high = "#B2182B",
+    midpoint = 0,
+    name = "Expression\n(Z-score)"
+  ) +
+  theme_minimal(base_size = 8) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(
+      angle = 40,
+      hjust = 1
+    ),
+    plot.title = element_text(
+      face = "bold",
+      size = 13
+    )
+  ) +
+  labs(
+    title = "Marker expression across cell states",
+    subtitle = "Computed directly from experimental data",
+    x = "Cell state",
+    y = "Marker"
+  )
+
+print(p)
+```
+
+```{r}
+library(randomForest)
+
+set.seed(42)
+
+rf_model <- randomForest(
+  x = as.data.frame(X),
+  y = as.factor(y),
+  ntree = 500,
+  mtry = floor(sqrt(ncol(X))),
+  importance = TRUE
+)
+
+saveRDS(
+  rf_model,
+  file = file.path(out_dir, "RandomForest_model.rds")
+)
+
+rf_model
+
+```
+```{r}
+library(dplyr)
+library(ggplot2)
+
+rf_imp_df <- randomForest::importance(rf_model) |>
+  as.data.frame() |>
+  tibble::rownames_to_column("Marker") |>
+  arrange(desc(MeanDecreaseGini)) |>
+  slice_head(n = 20)
+
+rf_imp_df <- rf_imp_df |>
+  mutate(
+    Module = case_when(
+      Marker %in% c("Ecad","panCK","Ki67") ~ "Tumor",
+      Marker %in% c("CD3","CD8a","CD45","CD7") ~ "Lymphoid",
+      Marker %in% c("CD204","CD11c","CD11b","Arg1","CD66b") ~ "Myeloid",
+      Marker %in% c("SMA","Podoplanin","CD146","CD31") ~ "Stroma",
+      TRUE ~ "Other"
+    )
+  )
+
+p_rf <- ggplot(
+  rf_imp_df,
+  aes(
+    x = reorder(Marker, MeanDecreaseGini),
+    y = MeanDecreaseGini,
+    fill = Module
+  )
+) +
+  geom_col(width = 0.8) +
+  coord_flip() +
+  scale_fill_manual(
+    values = c(
+      Tumor = "#E53935",
+      Lymphoid = "#1E88E5",
+      Myeloid = "#43A047",
+      Stroma = "#FB8C00",
+      Other = "#9E9E9E"
+    )
+  ) +
+  labs(
+    title = "Random Forest marker importance",
+    subtitle = paste0(
+      "Accuracy = ",
+      round(cm_test$overall["Accuracy"],3),
+      "   |   Kappa = ",
+      round(cm_test$overall["Kappa"],3)
+    ),
+    x = NULL,
+    y = "Mean Decrease Gini"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18),
+    plot.subtitle = element_text(size = 13),
+    legend.position = "right",
+    panel.grid.major.y = element_blank(),
+    axis.text.y = element_text(face = "bold")
+  )
+
+print(p_rf)
+```
+```{r}
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+
+# ---------------------------
+# Random Forest importance
+# ---------------------------
+
+rf_df <- randomForest::importance(rf_model) |>
+  as.data.frame() |>
+  rownames_to_column("Marker") |>
+  select(Marker, MeanDecreaseGini) |>
+  mutate(
+    RF = MeanDecreaseGini / sum(MeanDecreaseGini)
+  ) |>
+  select(Marker, RF)
+
+# ---------------------------
+# XGBoost importance
+# ---------------------------
+
+xgb_df <- var_imp |>
+  as.data.frame() |>
+  transmute(
+    Marker = Feature,
+    XGBoost = Gain / sum(Gain)
+  )
+
+# ---------------------------
+# Merge
+# ---------------------------
+
+imp_compare <- full_join(
+  rf_df,
+  xgb_df,
+  by = "Marker"
+) |>
+  mutate(
+    RF = ifelse(is.na(RF), 0, RF),
+    XGBoost = ifelse(is.na(XGBoost), 0, XGBoost)
+  )
+
+
+top_markers <- imp_compare |>
+  mutate(mean_imp = (RF + XGBoost) / 2) |>
+  arrange(desc(mean_imp)) |>
+  slice_head(n = 20) |>
+  pull(Marker)
+
+plot_df <- imp_compare |>
+  filter(Marker %in% top_markers) |>
+  pivot_longer(
+    cols = c(RF, XGBoost),
+    names_to = "Model",
+    values_to = "Importance"
+  )
+
+# ---------------------------
+# Plot
+# ---------------------------
+
+p_compare <- ggplot(
+  plot_df,
+  aes(
+    x = Importance,
+    y = reorder(Marker, Importance),
+    fill = Model
+  )
+) +
+  geom_col(
+    position = "dodge",
+    width = 0.8
+  ) +
+ scale_fill_manual(
+  values = c(
+    RF = "#D55E00",      
+    XGBoost = "#0072B2"  
+  )
+
+  ) +
+  labs(
+    title = "Marker importance across two models",
+    subtitle = paste0(
+      "Random Forest (Accuracy = ",
+      round(cm_test$overall["Accuracy"],3),
+      ", Kappa = ",
+      round(cm_test$overall["Kappa"],3),
+      ")"
+    ),
+    x = "Normalized importance",
+    y = "Marker"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18),
+    plot.subtitle = element_text(size = 12),
+    legend.title = element_blank()
+  )
+
+print(p_compare)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
