@@ -94,6 +94,7 @@ rownames(rowData(spe))
 # STEP 02 — Compensate (spillover correction)
 # =====================================================================
 # NOTE:
+# we need to have IMMUcan_panel_2_2.10_compensation/ all think how to re-point
 # Spillover в IMC (Imaging Mass Cytometry) — це коли сигнал одного металу "протікає" в інший канал.
 # читаємо TIFF-зрізи одиничних барвників (compensation slide) у окремий об'єкт sceTIFF —
 # вони потрібні, щоб оцінити spillover-матрицю між каналами металів.
@@ -924,17 +925,18 @@ split_test_rows <- function(counts,
 ## looking for a seed with the best distribution between train/test
 
 ```{r}
-# NOTE: запускаємо оптимізатор поділу з підвищеною вагою (rare_weight=20) для рідкісних типів
-# (B, BnT, MDSC, Igg, mregDC, NK), 1000 рестартів; res$summary показує досягнуті частки тесту.
-res <- split_test_rows(
-  dat,
+# NOTE: параметри поділу винесені в split_params (єдине джерело — їх же показуємо в підсумку).
+# Підвищена вага (rare_weight=20) для рідкісних типів (B, BnT, MDSC, Igg, mregDC, NK), 1000 рестартів.
+split_params <- list(
   default_test_frac = 0.20,
-  rare_test_frac = 0.20,
-  rare_labels = c("B", "BnT", "MDSC", "Igg", "mregDC", "NK"),
-  rare_weight = 20,
-  n_restarts = 1000,
-  seed = 42
+  rare_test_frac    = 0.20,
+  rare_labels       = c("B", "BnT", "MDSC", "Igg", "mregDC", "NK"),
+  rare_weight       = 20,
+  n_restarts        = 1000,
+  seed              = 42
 )
+
+res <- do.call(split_test_rows, c(list(counts = dat), split_params))
 
 res$summary
 ```
@@ -942,11 +944,10 @@ res$summary
 
 ```{r}
 # NOTE: друкуємо підсумок поділу (скільки знімків у тесті, значення цільової функції).
-# УВАГА: цей чанк використовує df і dt, яких не визначено вище — впаде, якщо їх не задати.
-cat(sprintf("Test rows: %d / %d (%.1f%%) | objective = %.5f | %.3fs\n",
-            length(res$test_idx), nrow(df),
-            100 * length(res$test_idx) / nrow(df),
-            res$score, dt))
+cat(sprintf("Test rows: %d / %d (%.1f%%) | objective = %.5f\n",
+            length(res$test_idx), nrow(dat),
+            100 * length(res$test_idx) / nrow(dat),
+            res$score))
 print(res$summary)
 ```
 
@@ -1358,7 +1359,7 @@ best_cv <- xgboost::xgb.cv(
 
 ## Check CV accuracy per cell type for the best model
 
-```{r cv-accuracy-per-celltype, fig.height=8, fig.width=12}
+```{r cv-confusion-build, fig.height=8, fig.width=12}
 # NOTE: з out-of-fold ймовірностей беремо передбачений клас для кожної клітини (max.col),
 # повертаємо назви типів через label_mapping і будуємо confusion matrix проти істинних міток.
 # Extract out-of-fold predicted class probabilities from the best CV model.
@@ -1442,7 +1443,7 @@ table(cur_sce$predicted,cur_sce$cell_labels)
 ```
 
 
-```{r cv-accuracy-per-celltype, fig.height=8, fig.width=12}
+```{r cv-overall, fig.height=8, fig.width=12}
 # NOTE: загальні метрики CV-моделі (Accuracy, Kappa, no-information rate, p-value).
 cm_cv$overall
 # > cm_cv$overall
@@ -1460,7 +1461,7 @@ cm_cv$overall
 
 
 
-```{r cv-accuracy-per-celltype, fig.height=8, fig.width=12}
+```{r cv-byclass, fig.height=8, fig.width=12}
 # NOTE: метрики окремо по кожному типу клітин — Sensitivity (TPR), Specificity, Pos Pred Value (precision).
 cm_cv$byClass
 # > cm_cv$byClass
@@ -1760,7 +1761,7 @@ The higher min_child_weight value performs better,
 indicating that a more conservative tree-splitting strategy is preferable for these data
 
 
-```{r model-evaluation-curves, fig.height=10, fig.width=12}
+```{r model-eval-best, fig.height=10, fig.width=12}
 # NOTE: визначаємо єдину найкращу модель (один рядок) за тестовим mlogloss.
 best_model_summary <- eval_data |>
   dplyr::filter(Type == "Test", is_best_iteration) |>
@@ -1771,7 +1772,7 @@ best_model_summary
 ```
 
 
-```{r model-evaluation-curves, fig.height=10, fig.width=12}
+```{r model-eval-bestname, fig.height=10, fig.width=12}
 # NOTE: дістаємо назву параметрів, найкращу ітерацію і loss найкращої моделі для підпису на графіку.
 best_param_name <- best_model_summary$params
 best_iter <- best_model_summary$best_iteration
@@ -1779,7 +1780,7 @@ best_loss <- best_model_summary$best_mlogloss
 ```
 
 
-```{r model-evaluation-curves, fig.height=10, fig.width=14}
+```{r model-eval-curves-plot, fig.height=10, fig.width=14}
 # NOTE: криві mlogloss по ітераціях бустингу для всіх моделей (фасет Train/Test x eta),
 # з позначкою обраної найкращої ітерації — видно перенавчання при глибших деревах.
 ggplot(
@@ -1865,7 +1866,7 @@ final_model <- xgboost::xgb.train(
 
 save final model via saveRDS
 
-```{r train-final-model, message = FALSE, eval = TRUE}
+```{r train-final-model-save, message = FALSE, eval = TRUE}
 # NOTE: (закоментовано) збереження фінальної моделі у .rds; розкоментуй, щоб зберегти на диск.
 # saveRDS(
 #   final_model,
@@ -1912,7 +1913,7 @@ var_imp_top <- var_imp |>
 ```
 
 
-```{r variable-importance, fig.height=8, fig.width=8}
+```{r variable-importance-plot, fig.height=8, fig.width=8}
 # NOTE: стовпчиковий графік топ-20 найважливіших маркерів за Gain.
 ggplot(var_imp_top, aes(x = Gain, y = Feature)) +
   geom_col(fill = "steelblue") +
@@ -1978,7 +1979,7 @@ Xy_test
 
 ## visualize predicted results
 
-```{r test-performance, fig.height=8, fig.width=12}
+```{r test-performance-prob, fig.height=8, fig.width=12}
 # NOTE: прогноз фінальної моделі на тесті; xgb віддає плаский вектор ймовірностей, тому пробуємо
 # обидва способи reshape у матрицю (клітини x класи) і перевіряємо, де ймовірності сумуються в 1.
 raw_test_pred <- predict(final_model, newdata = Xy_test)
@@ -2002,7 +2003,7 @@ mean(abs(rowSums(test_prob_bycol) - 1))
 ```
 
 
-```{r test-performance, fig.height=8, fig.width=12}
+```{r test-performance-orient, fig.height=8, fig.width=12}
 # NOTE: обираємо правильно зорієнтовану матрицю ймовірностей, перевіряємо розміри та підписуємо
 # рядки (cell_id) і стовпці (типи клітин з label_mapping).
 if (
@@ -2068,11 +2069,11 @@ cm_test$overall
 
 
 
-```{r test-performance, fig.height=8, fig.width=12}
+```{r test-performance-plot, fig.height=8, fig.width=12}
 # NOTE: фінальний графік продуктивності на тесті — TPR (Sensitivity) vs FPR (1-Specificity)
 # по кожному типу клітин; розмір точки = частота виявлення.
 # Per-cell-type performance plot.
-test_perf <- data.frame(cm_test$byClass) |> 
+test_perf <- data.frame(cm_test$byClass) |>
   dplyr::mutate(
     class = sub("Class: ", "", rownames(cm_test$byClass)),
     fpr = 1 - Specificity
@@ -2118,6 +2119,213 @@ ggplot(test_perf) +
   ylab("Sensitivity (TPR)") +
   xlab("1 - Specificity (FPR)")
 ```
+
+
+# Підсумок прогону
+
+## Main_training_results (головний результат)
+
+**Головний результат роботи моделі — це CV accuracy / Kappa** (out-of-fold, усереднено по 5
+згрупованих фолдах — чесна оцінка узагальнення). Test accuracy наведена лише довідково: вона
+**завищена** дисбалансом класів (NIR тесту ≈ 0.869, бо ~87% тестових клітин — Tumor). Деталі
+по кожному типу — у `byClass` та confusion matrix нижче.
+
+```{r Main_training_results, eval=TRUE}
+Main_training_results <- data.frame(
+  metric = c(
+    "CV accuracy (out-of-fold) — ГОЛОВНЕ",
+    "CV Kappa — ГОЛОВНЕ",
+    "macro Sensitivity (CV, серед. по типах)",
+    "macro Precision (CV, серед. по типах)",
+    "No-information rate (test)",
+    "Test accuracy (довідково, завищена)",
+    "Test Kappa",
+    "К-сть класів",
+    "Train клітин",
+    "Test клітин"
+  ),
+  value = c(
+    round(cm_cv$overall["Accuracy"], 4),
+    round(cm_cv$overall["Kappa"], 4),
+    round(mean(cm_cv$byClass[, "Sensitivity"], na.rm = TRUE), 4),
+    round(mean(cm_cv$byClass[, "Pos Pred Value"], na.rm = TRUE), 4),
+    round(cm_test$overall["AccuracyNull"], 4),
+    round(cm_test$overall["Accuracy"], 4),
+    round(cm_test$overall["Kappa"], 4),
+    num_classes,
+    ncol(train_sce),
+    ncol(test_sce)
+  ),
+  row.names = NULL
+)
+Main_training_results
+write.csv(Main_training_results, "Main_training_results.csv", row.names = FALSE)
+```
+
+## 1. Train/test поділ (+ збереження на диск)
+
+Поділ зроблено **на рівні знімків** (`sample_id`) — усі клітини знімка йдуть в один бік,
+тож витоку між train і test немає.
+
+**Параметри `split_test_rows()`, що використані:**
+
+```{r summary-split-params, eval=TRUE}
+data.frame(
+  parameter = c("default_test_frac", "rare_test_frac", "rare_labels",
+                "rare_weight", "n_restarts", "seed"),
+  value = c(
+    as.character(split_params$default_test_frac),
+    as.character(split_params$rare_test_frac),
+    paste(split_params$rare_labels, collapse = ", "),
+    as.character(split_params$rare_weight),
+    as.character(split_params$n_restarts),
+    as.character(split_params$seed)),
+  meaning = c(
+    "частка клітин у тест для частих типів",
+    "частка клітин у тест для рідкісних типів",
+    "які типи вважаються рідкісними (балансуються окремо)",
+    "наскільки сильніше тягнути рідкісні типи до цілі",
+    "к-сть випадкових перезапусків оптимізатора",
+    "сід відтворюваності"),
+  row.names = NULL
+)
+```
+
+```{r summary-split, eval=TRUE}
+cat("TRAIN знімки (", length(res$train_rownames), "):\n", sep = "")
+print(res$train_rownames)
+cat("\nTEST знімки (", length(res$test_rownames), "):\n", sep = "")
+print(res$test_rownames)
+
+split_stats
+res$summary
+rare_balance
+
+write.csv(split_stats, "split_stats.csv", row.names = FALSE)
+
+split_images <- rbind(
+  data.frame(sample_id = res$train_rownames, split = "train"),
+  data.frame(sample_id = res$test_rownames,  split = "test")
+)
+write.csv(split_images, "split_images.csv", row.names = FALSE)
+
+saveRDS(
+  list(
+    train_cell_ids = colnames(train_sce),
+    test_cell_ids  = colnames(test_sce),
+    train_images   = res$train_rownames,
+    test_images    = res$test_rownames,
+    summary        = res$summary,
+    split_stats    = split_stats
+  ),
+  "split.rds"
+)
+
+cat("\nЗбережено: split_stats.csv, split_images.csv, split.rds\n")
+```
+
+## 2. Параметри моделі XGBoost
+
+```{r summary-params, eval=TRUE}
+data.frame(
+  parameter = c("max_depth", "eta (learning rate)", "subsample", "colsample_bytree",
+                "min_child_weight", "nrounds", "objective", "eval_metric", "num_class"),
+  value = as.character(c(
+    params_best$max_depth, params_best$eta, params_best$subsample,
+    params_best$colsample_bytree, params_best$min_child_weight, best_nrounds,
+    params_best$objective, params_best$eval_metric, params_best$num_class)),
+  meaning = c(
+    "глибина дерева (складність)", "внесок кожного дерева", "частка клітин на дерево",
+    "частка маркерів на дерево", "мін. вага в листі (консервативність)",
+    "к-сть дерев (раундів)", "багатоклас. класифікація", "метрика (log-loss)",
+    "к-сть класів"),
+  row.names = NULL
+)
+```
+
+## 3. Очистка даних — так, робилась
+
+**(а) Консолідація міток:**
+
+```{r summary-consolidation, eval=TRUE}
+consolidation_stats
+```
+
+**(б) Біологічні правила очистки** (к-сть зачеплених клітин):
+
+```{r summary-cleaning-rules, eval=TRUE}
+.lab <- spe_27[, !is.na(spe_27$cell_labels) & spe_27$cell_labels != "unlabelled"]
+.e   <- assay(.lab, "exprs")
+
+data.frame(
+  rule = c("Igg з IgG<1 — ВИДАЛЕНО",
+           "NK з CD7<0.5 — ВИДАЛЕНО",
+           "mregDC з panCK>0.5 | Ecad>0.8 — ПЕРЕМІЧЕНО на Tumor",
+           "1 порожній знімок — ВИДАЛЕНО (28 -> 27 знімків)"),
+  n_cells = c(
+    sum(.lab$cell_labels == "Igg" & .e["IgG", ] < 1),
+    sum(.lab$cell_labels == "NK"  & .e["CD7", ] < 0.5),
+    sum(.lab$cell_labels == "mregDC" & (.e["panCK", ] > 0.5 | .e["Ecad", ] > 0.8)),
+    NA_integer_
+  ),
+  row.names = NULL
+)
+```
+
+## 4. Метрики на held-out тесті
+
+**Per-class sensitivity / precision** (рідкісні типи слабші):
+
+```{r summary-test-byclass, eval=TRUE}
+round(as.data.frame(cm_test$byClass)[, c("Sensitivity", "Specificity",
+                                         "Pos Pred Value", "Detection Rate")], 3)
+```
+
+**Повна confusion matrix** (рядки = predicted, стовпці = reference/істина):
+
+```{r summary-test-confusion, eval=TRUE}
+cm_mat <- as.data.frame.matrix(cm_test$table)
+cm_mat
+write.csv(cm_mat, "confusion_matrix_test.csv")
+```
+
+**Матриця прогнозів по клітинах** (predicted) — зберігається у `test_predictions.csv`:
+
+```{r summary-test-predicted, eval=TRUE}
+pred_df <- data.frame(
+  cell_id   = rownames(test_prob),
+  true      = as.character(test_true),
+  predicted = as.character(test_pred),
+  prob_max  = round(apply(test_prob, 1, max), 3),
+  correct   = as.character(test_true) == as.character(test_pred),
+  row.names = NULL
+)
+write.csv(pred_df, "test_predictions.csv", row.names = FALSE)
+
+cat("Розподіл ПЕРЕДБАЧЕНИХ класів на тесті:\n")
+print(table(predicted = test_pred))
+
+cat("\nПерші 20 прогнозів:\n")
+head(pred_df, 20)
+```
+
+## 5. Що ще робилось (повний пайплайн)
+
+1. **Read** — `read_steinbock()` будує SPE.
+2. **Spillover-компенсація** (CATALYST) — `compCytof()`, `exprs = asinh(counts / cofactor)`.
+3. **Імпорт ручних гейтів** → нормалізація міток → матч по `cell_id`.
+4. **Консолідація** дублікатів/doublets.
+5. **Очистка** — біологічні правила + видалення порожнього знімка.
+6. **Train/test поділ** на рівні знімків (`split_test_rows`, `seed=42`).
+7. **Ваги класів** (inverse-frequency; `undefined` ÷10, `Igg` ÷30).
+8. **Підбір параметрів** — grid-search `xgb.cv` (12 комбінацій), згруповані фолди.
+9. **Фінальна модель** `xgb.train` + оцінка на held-out тесті.
+
+> ⚠️ **Головне:** результат роботи моделі = **CV accuracy ≈ 0.979 / Kappa ≈ 0.934**
+> (точні числа — у блоці `Main_training_results` вище). Ще чесніший погляд — **macro-метрики**
+> (серед. по типах): Sensitivity ≈ 0.80, Precision ≈ 0.79 — вони нижчі за загальну accuracy,
+> бо рідкісні типи слабші. Test accuracy ≈ 0.994 — лише довідкова й завищена Tumor-дисбалансом
+> (NIR ≈ 0.869).
 
 
 

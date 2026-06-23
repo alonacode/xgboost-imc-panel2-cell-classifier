@@ -1,0 +1,173 @@
+---
+title: "XGBoost + Random Forest soft-voting ensemble (05_models_other)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: kable
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 5)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+```
+
+```{r load}
+base_path <- "/Users/svitlanamoiseyenko/Repos/genomic/xgboost-imc-panel2-cell-classifier/XGBoost_classifier/Panel_2_10"
+rds_path  <- file.path(base_path, "ROut", "report_ensemble.rds")
+stopifnot(file.exists(rds_path))
+
+rep      <- readRDS(rds_path)
+results  <- rep$results
+resultsA <- rep$resultsA
+resultsB <- rep$resultsB
+cm_store <- rep$cm_store
+cfg      <- rep$config
+critical <- c("MDSC", "BnT", "Igg", "mregDC", "PMN_MDSC", "Neutrophil")
+```
+
+## What this is
+
+XGBoost and a Random Forest (`ranger`) are combined by **weighted soft-voting** on class
+probabilities: `P = α·P_xgb + (1−α)·P_rf`, argmax to decode. `α=1` is XGB-only, `α=0` is RF-only.
+Both models share the tier-aware split, the image-grouped CV folds, and the inverse-frequency class
+weights. Because Tumor dominates (raw accuracy is inflated), the headline metric is **critical-class
+recall** (mean sensitivity over `r paste(critical, collapse=", ")`), behind an
+accuracy ≥ `r cfg$acc_floor` / Kappa ≥ `r cfg$kappa_floor` guardrail — the same rule as the rest of
+sys_results.
+
+- **Stage A**: `r length(cfg$xgb_configs)` XGB × `r length(cfg$rf_configs)` RF configs swept over α at
+  the fixed best split.
+- **Stage B**: the winning ensemble re-evaluated across a 3×3 tier-split factorial.
+
+## Stage A — does blending beat the single models?
+
+```{r alpha-curves, fig.height=5.5}
+ens <- resultsA |> filter(model_kind == "ensemble")
+xo  <- resultsA |> filter(model_kind == "xgb_only")
+ro  <- resultsA |> filter(model_kind == "rf_only")
+
+# Build a full α-curve (0..1) per XGB×RF combo by attaching the matching singleton endpoints.
+combos <- ens |> distinct(xgb_id, rf_id)
+curve <- pmap_dfr(combos, function(xgb_id, rf_id) {
+  mid <- ens |> filter(xgb_id == !!xgb_id, rf_id == !!rf_id)
+  lo  <- ro  |> filter(rf_id  == !!rf_id)  |> mutate(xgb_id = !!xgb_id)
+  hi  <- xo  |> filter(xgb_id == !!xgb_id) |> mutate(rf_id  = !!rf_id)
+  bind_rows(lo, mid, hi) |>
+    mutate(combo = paste0(!!xgb_id, " + ", !!rf_id)) |>
+    arrange(alpha)
+})
+
+ggplot(curve, aes(alpha, Sensitivity_critical_mean_test, color = rf_id)) +
+  geom_line() + geom_point(size = 1.6) +
+  facet_wrap(~ xgb_id) +
+  labs(title = "Critical-class recall (test) vs blend weight α",
+       subtitle = "α=0 RF-only · α=1 XGB-only · interior = ensemble",
+       x = "α (XGB weight)", y = "mean critical-class sensitivity (test)") +
+  theme_bw()
+```
+
+```{r alpha-curves-metrics, fig.height=5.5}
+curve_long <- curve |>
+  select(combo, xgb_id, rf_id, alpha,
+         `critical recall` = Sensitivity_critical_mean_test,
+         `macro-F1` = F1_macro_test, `Kappa` = Kappa_test) |>
+  pivot_longer(c(`critical recall`, `macro-F1`, `Kappa`), names_to = "metric")
+
+ggplot(curve_long, aes(alpha, value, color = combo)) +
+  geom_line(alpha = 0.7) +
+  facet_wrap(~ metric, scales = "free_y") +
+  labs(title = "Test metrics vs α, by XGB×RF combo", x = "α (XGB weight)", y = NULL) +
+  theme_bw() + theme(legend.position = "none")
+```
+
+## Head-to-head: best ensemble vs best single models
+
+Guardrail-best within each family (rank by critical recall, then macro-F1, then Kappa).
+
+```{r head-to-head}
+cols <- c("model_id","model_kind","alpha","xgb_id","rf_id",
+          "Accuracy_test","Kappa_test","BalancedAccuracy_macro_test","F1_macro_test",
+          "Sensitivity_critical_mean_test","F1_critical_mean_test")
+h2h <- bind_rows(rep$best_xgb, rep$best_rf, rep$best_ens)[, cols]
+knitr::kable(h2h, digits = 3, caption = "Best XGB-only / RF-only / ensemble (held-out test)")
+```
+
+```{r delta}
+delta <- data.frame(
+  metric = c("Accuracy", "Kappa", "BalancedAcc_macro", "macro-F1", "critical recall", "critical F1"),
+  best_single = c(
+    max(rep$best_xgb$Accuracy_test, rep$best_rf$Accuracy_test),
+    max(rep$best_xgb$Kappa_test, rep$best_rf$Kappa_test),
+    max(rep$best_xgb$BalancedAccuracy_macro_test, rep$best_rf$BalancedAccuracy_macro_test),
+    max(rep$best_xgb$F1_macro_test, rep$best_rf$F1_macro_test),
+    max(rep$best_xgb$Sensitivity_critical_mean_test, rep$best_rf$Sensitivity_critical_mean_test),
+    max(rep$best_xgb$F1_critical_mean_test, rep$best_rf$F1_critical_mean_test)),
+  ensemble = c(rep$best_ens$Accuracy_test, rep$best_ens$Kappa_test,
+               rep$best_ens$BalancedAccuracy_macro_test, rep$best_ens$F1_macro_test,
+               rep$best_ens$Sensitivity_critical_mean_test, rep$best_ens$F1_critical_mean_test)
+)
+delta$ensemble_gain <- round(delta$ensemble - delta$best_single, 3)
+knitr::kable(delta, digits = 3, caption = "Ensemble minus best single model (positive = blend helps)")
+```
+
+### Per-critical-class sensitivity (test)
+
+```{r per-critical}
+sens_cols <- paste0("Sens_", critical, "_test")
+per_crit <- bind_rows(rep$best_xgb, rep$best_rf, rep$best_ens)[, c("model_kind", sens_cols)]
+names(per_crit) <- c("model_kind", critical)
+knitr::kable(per_crit, digits = 3)
+```
+
+### Confusion matrix — winning ensemble (held-out test)
+
+```{r cm-ensemble}
+knitr::kable(as.data.frame.matrix(cm_store$ensemble$table),
+             caption = "Rows = predicted, columns = reference (ensemble)")
+```
+
+## Stage B — split/knob sensitivity of the winning ensemble
+
+Winner: `r cfg$winner$xgb_id` + `r cfg$winner$rf_id`, α = `r cfg$winner$alpha`, re-evaluated across the
+tier-split factorial. **Caveat:** each split produces a different held-out test set, so differences
+mix model behaviour with which images land in test.
+
+```{r stage-b, fig.height=4.2}
+ggplot(resultsB, aes(factor(tier_test_frac_critical), Sensitivity_critical_mean_test,
+                     color = factor(tier_weight_critical), group = factor(tier_weight_critical))) +
+  geom_line() + geom_point(size = 2) +
+  labs(title = "Critical-class recall across the tier-split factorial",
+       x = "critical test fraction", y = "critical recall (test)",
+       color = "critical weight") +
+  theme_bw()
+
+knitr::kable(
+  resultsB |>
+    select(tier_test_frac_critical, tier_weight_critical, n_test_cells, n_test_images,
+           Accuracy_test, Kappa_test, Sensitivity_critical_mean_test, F1_critical_mean_test) |>
+    arrange(desc(Sensitivity_critical_mean_test)),
+  digits = 3)
+```
+
+## Conclusion
+
+```{r conclusion, results='asis'}
+g <- delta$ensemble_gain[delta$metric == "critical recall"]
+if (g > 0.005) {
+  cat(sprintf("- The ensemble **improves** critical-class recall by %.3f over the best single model — soft-voting is worth keeping for the rare populations.\n", g))
+} else if (g < -0.005) {
+  cat(sprintf("- The ensemble is **worse** than the best single model on critical recall (%.3f) — blending does not help here; prefer the single model.\n", g))
+} else {
+  cat("- The ensemble is **on par** with the best single model on critical recall (no meaningful gain) — blending neither helps nor hurts.\n")
+}
+cat(sprintf("- Best ensemble: %s + %s at α=%.2f (Kappa_test %.3f, critical recall %.3f).\n",
+            cfg$winner$xgb_id, cfg$winner$rf_id, cfg$winner$alpha,
+            rep$best_ens$Kappa_test, rep$best_ens$Sensitivity_critical_mean_test))
+cat("- As everywhere in this project: raw accuracy is inflated by Tumor; judge by Kappa / macro-F1 / critical recall.\n")
+```

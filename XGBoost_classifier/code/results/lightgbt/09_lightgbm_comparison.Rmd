@@ -1,0 +1,249 @@
+---
+title: "LightGBM vs XGBoost — Panel 2 IMC cell classifier"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: kable
+    self_contained: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.align = "center", dpi = 110)
+suppressMessages({
+  library(dplyr); library(tidyr); library(ggplot2); library(knitr); library(scales)
+})
+R <- readRDS("lgb_comparison.rds")
+model_cols <- c(XGBoost = "#2166ac", `Random Forest` = "#9970ab",
+                LightGBM = "#e67e22", RandomForest = "#9970ab")
+```
+
+## Summary
+
+Three classifiers — **XGBoost** (the production model), **Random Forest**, and **LightGBM** —
+were trained on the **same image-level train/test split** of the manually gated Panel 2 IMC
+cells and evaluated on the held-out test set. LightGBM is added by the `kos.Rmd` fork; it shares
+the exact feature matrix, label mapping, and inverse-frequency class weights used by XGBoost.
+
+- **Train:** `r format(R$n_train, big.mark=",")` cells from `r R$n_train_images` images
+- **Test:** `r format(R$n_test, big.mark=",")` labelled cells from `r R$n_test_images` images
+- **Classes:** `r length(R$label_mapping)` cell types · **Features:** `r nrow(R$varimp)` markers (DNA/Histone excluded)
+
+```{r headline}
+R$metrics |>
+  mutate(Accuracy = round(Accuracy, 4), Kappa = round(Kappa, 4),
+         `Test mlogloss` = round(Test_mlogloss, 4)) |>
+  select(Model, Accuracy, Kappa, `Test mlogloss`) |>
+  arrange(desc(Accuracy)) |>
+  kable(caption = "Held-out test performance (higher Accuracy/Kappa, lower mlogloss = better)")
+```
+
+**Verdict:** LightGBM edges out XGBoost on every metric (accuracy
+`r round(R$metrics$Accuracy[R$metrics$Model=="LightGBM"],4)` vs
+`r round(R$metrics$Accuracy[R$metrics$Model=="XGBoost"],4)`), but the gap is tiny
+(< 0.1 pp). Both gradient-boosting models clearly beat Random Forest.
+
+## Train / test split
+
+The split is at the **image level** (every cell of an image goes to one side) using the
+project's `split_test_rows()` optimizer, called with:
+
+```{r split-params}
+data.frame(
+  parameter = c("default_test_frac", "rare_test_frac", "rare_labels",
+                "rare_weight", "n_restarts", "seed"),
+  value = c("0.20", "0.20", "B, BnT, MDSC, Igg, mregDC, NK", "20", "1000", "42")
+) |> kable(caption = "split_test_rows() configuration (identical for all three models)")
+```
+
+```{r split-fig, fig.width=9, fig.height=4.5}
+ss <- R$split_stats |>
+  pivot_longer(c(train_n, test_n), names_to = "split", values_to = "n") |>
+  mutate(split = recode(split, train_n = "train", test_n = "test"),
+         cell_label = factor(cell_label, levels = R$split_stats$cell_label[order(-rowSums(R$split_stats[,-1]))]))
+ggplot(ss, aes(cell_label, n, fill = split)) +
+  geom_col(position = "stack") +
+  scale_fill_manual(values = c(train = "#4575b4", test = "#d73027")) +
+  scale_y_log10(labels = comma) +
+  theme_bw(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = NULL, y = "cells (log10)", fill = NULL,
+       title = "Train / test cell counts per class")
+```
+
+```{r split-frac}
+R$split_summary |>
+  transmute(label, total, test_count, train_count,
+            target_test_frac, achieved_test_frac, rare = is_rare) |>
+  arrange(desc(total)) |>
+  kable(caption = "Achieved test fraction per class vs target")
+```
+
+## How LightGBM was used
+
+LightGBM is wired identically to XGBoost — same `X`, `label_mapping`, and the inverse-frequency
+class weights (`undefined`/10, `Igg`/30) applied **per cell** via `lgb.Dataset(weight=...)`. The
+test set is passed as the validation set (`reference = dtrain`) and drives **early stopping**.
+
+```{r lgb-params}
+lp <- R$lgb_params
+data.frame(
+  parameter = names(lp),
+  value = sapply(lp, function(x) as.character(x))
+) |> kable(caption = "LightGBM parameters (kos.Rmd)")
+```
+
+- **Objective:** `multiclass` (softmax over `r length(R$label_mapping)` classes), metric multiclass log-loss.
+- **Boosting:** `nrounds = 500` with `early_stopping_rounds = 20` →
+  **best iteration = `r R$lgb_best_iter`** (vs XGBoost's fixed 108 rounds at `max_depth = 3`).
+- **Tree shape:** leaf-wise growth, `num_leaves = 31`, `max_depth = 4`, `learning_rate = 0.1`,
+  feature/row subsampling 0.8, `lambda_l2 = 1.0`.
+- **Note:** early stopping monitors the test set itself, so the reported LightGBM mlogloss is
+  mildly optimistic relative to XGBoost (whose rounds were fixed by grouped CV).
+
+## Final metrics & comparison
+
+```{r acc-fig, fig.width=8, fig.height=4}
+m <- R$metrics |> mutate(Model = factor(Model, levels = Model[order(Accuracy)]))
+ggplot(m, aes(Accuracy, Model, fill = Model)) +
+  geom_col(width = .65) +
+  geom_text(aes(label = sprintf("%.4f", Accuracy)), hjust = 1.1, color = "white", fontface = "bold") +
+  scale_fill_manual(values = model_cols, guide = "none") +
+  coord_cartesian(xlim = c(0.97, 1)) +
+  theme_bw(base_size = 12) +
+  labs(x = "Test accuracy", y = NULL, title = "Overall accuracy")
+```
+
+```{r kappa-logloss-fig, fig.width=9, fig.height=3.6}
+mm <- R$metrics |>
+  select(Model, Kappa, Test_mlogloss) |>
+  pivot_longer(-Model, names_to = "metric", values_to = "value") |>
+  mutate(metric = recode(metric, Test_mlogloss = "Test mlogloss"))
+ggplot(mm, aes(value, Model, fill = Model)) +
+  geom_col(width = .65) +
+  geom_text(aes(label = sprintf("%.3f", value)), hjust = -0.1, size = 3.2) +
+  scale_fill_manual(values = model_cols, guide = "none") +
+  facet_wrap(~metric, scales = "free_x") +
+  theme_bw(base_size = 11) +
+  labs(x = NULL, y = NULL, title = "Cohen's kappa and test log-loss") +
+  theme(plot.margin = margin(5, 18, 5, 5))
+```
+
+### Per-class sensitivity
+
+Where the models differ is the **rare classes**. Below, recall (sensitivity) per cell type.
+
+```{r byclass-fig, fig.width=10, fig.height=6}
+bc <- R$byclass |>
+  pivot_longer(-class, names_to = "Model", values_to = "Sensitivity") |>
+  mutate(Sensitivity = ifelse(is.na(Sensitivity), 0, Sensitivity))
+ord <- R$byclass |> mutate(m = rowMeans(cbind(XGBoost, RandomForest, LightGBM), na.rm = TRUE)) |>
+  arrange(m) |> pull(class)
+bc <- bc |> mutate(class = factor(class, levels = ord),
+                   Model = recode(Model, RandomForest = "Random Forest"))
+ggplot(bc, aes(Sensitivity, class, fill = Model)) +
+  geom_col(position = position_dodge(width = .75), width = .7) +
+  scale_fill_manual(values = model_cols) +
+  theme_bw(base_size = 11) +
+  labs(x = "Sensitivity (recall)", y = NULL, fill = NULL,
+       title = "Per-class recall — XGBoost vs Random Forest vs LightGBM")
+```
+
+```{r byclass-tab}
+R$byclass |>
+  mutate(across(c(XGBoost, RandomForest, LightGBM), ~ round(.x, 3))) |>
+  rename(`Random Forest` = RandomForest) |>
+  arrange(class) |>
+  kable(caption = "Per-class sensitivity")
+```
+
+### FPR vs TPR (XGBoost vs LightGBM)
+
+```{r roc-fig, fig.width=8.5, fig.height=6}
+mk_perf <- function(cm, model) {
+  data.frame(cm$byClass) |>
+    transmute(class = sub("Class: ", "", rownames(cm$byClass)),
+              TPR = Sensitivity, FPR = 1 - Specificity, model = model)
+}
+perf <- bind_rows(mk_perf(R$cm_test, "XGBoost"), mk_perf(R$cm_lgb, "LightGBM")) |>
+  filter(!is.na(TPR))
+ggplot(perf, aes(FPR, TPR, color = model)) +
+  geom_point(size = 2.4, alpha = .85) +
+  ggrepel::geom_text_repel(aes(label = class), size = 2.7, max.overlaps = Inf,
+                           show.legend = FALSE, segment.alpha = .4) +
+  scale_color_manual(values = model_cols) +
+  theme_bw(base_size = 11) +
+  labs(x = "1 - Specificity (FPR)", y = "Sensitivity (TPR)", color = NULL,
+       title = "Per-class operating points")
+```
+
+### LightGBM confusion matrix
+
+```{r cm-fig, fig.width=8.5, fig.height=7.5}
+tab <- as.data.frame(R$cm_lgb$table)
+ggplot(tab, aes(Reference, Prediction, fill = Freq)) +
+  geom_tile(color = "grey90") +
+  geom_text(aes(label = ifelse(Freq > 0, Freq, "")), size = 2.6) +
+  scale_fill_gradient(low = "white", high = "#e67e22", trans = "log1p", guide = "none") +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "LightGBM confusion matrix (held-out test)")
+```
+
+### Three-model consensus
+
+```{r consensus}
+cs <- R$consensus_stats
+data.frame(
+  metric = c("Full agreement (all 3 models)", "Majority agreement (>=2/3)",
+             "Majority-vote accuracy", "High-entropy cells (top 10%)",
+             "Full-agreement among high-entropy cells",
+             "Full-agreement among low-entropy cells"),
+  value = c(sprintf("%.2f%%", cs$full_agreement_pct),
+            sprintf("%.2f%%", cs$majority_agree_pct),
+            sprintf("%.4f", cs$majority_accuracy),
+            cs$n_high_entropy,
+            sprintf("%.1f%%", cs$high_entropy_full_agree_pct),
+            sprintf("%.1f%%", cs$low_entropy_full_agree_pct))
+) |> kable(caption = "XGBoost + RF + LightGBM consensus on the test set")
+```
+
+The three models fully agree on **`r sprintf("%.1f%%", cs$full_agreement_pct)`** of test cells.
+Disagreement concentrates in high-entropy (uncertain) cells, confirming entropy as a useful
+flag for cells needing review.
+
+## Marker importance
+
+```{r imp-fig, fig.width=9, fig.height=6.5}
+vi <- R$varimp |>
+  slice_max(mean_importance, n = 20) |>
+  select(Feature, XGBoost, LightGBM, RandomForest) |>
+  pivot_longer(-Feature, names_to = "Model", values_to = "Importance") |>
+  mutate(Model = recode(Model, RandomForest = "Random Forest"),
+         Feature = factor(Feature, levels = rev(R$varimp$Feature[1:20])))
+ggplot(vi, aes(Importance, Feature, fill = Model)) +
+  geom_col(position = position_dodge(width = .75), width = .7) +
+  scale_fill_manual(values = model_cols) +
+  theme_bw(base_size = 11) +
+  labs(x = "Normalized importance", y = NULL, fill = NULL,
+       title = "Top-20 markers by mean importance across models")
+```
+
+The top markers (CD3, CD204, CD209, CD20, Lamp3, CD31, FOXP3, …) agree with the expected
+biology and are largely shared across all three models, so the LightGBM gain comes from better
+fitting, not from a different feature basis.
+
+## Conclusion
+
+LightGBM is a **drop-in alternative that marginally outperforms XGBoost**
+(accuracy `r round(R$metrics$Accuracy[R$metrics$Model=="LightGBM"],4)` /
+kappa `r round(R$metrics$Kappa[R$metrics$Model=="LightGBM"],3)` vs
+`r round(R$metrics$Accuracy[R$metrics$Model=="XGBoost"],4)` /
+`r round(R$metrics$Kappa[R$metrics$Model=="XGBoost"],3)`), converging in only
+`r R$lgb_best_iter` rounds, while Random Forest lags on rare classes. Given the < 0.1 pp gap and
+that LightGBM's edge partly reflects early-stopping on the test set, the two boosters are
+effectively equivalent here; their **`r sprintf("%.1f%%", cs$full_agreement_pct)` consensus**
+makes a majority-vote ensemble the safest downstream choice.

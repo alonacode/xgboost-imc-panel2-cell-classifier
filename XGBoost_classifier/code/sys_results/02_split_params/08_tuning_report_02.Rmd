@@ -1,0 +1,226 @@
+---
+title: "XGBoost rare-cell tuning — split-parameter report"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: kable
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(dplyr)
+base_path <- "/Users/svitlanamoiseyenko/Repos/genomic/xgboost-imc-panel2-cell-classifier/XGBoost_classifier/Panel_2_10"
+obj  <- readRDS(file.path(base_path, "ROut", "report_cms_split.rds"))
+res  <- obj$results
+cm_store    <- obj$cm_store
+split_store <- obj$split_store
+split_grid  <- obj$split_grid
+best_xgb    <- obj$best_xgb
+best_s_id   <- obj$best_s_id
+
+critical <- c("MDSC", "BnT", "Igg", "mregDC", "PMN_MDSC", "Neutrophil")
+# stable display order: by split index S1..S10
+res <- res[order(suppressWarnings(as.integer(sub("S", "", res$model_id)))), ]
+r3 <- function(x) round(as.numeric(x), 4)
+```
+
+# Summary
+
+10 train/test **split configurations** (S1–S10) evaluated with the **model held fixed at M9** — the
+guardrail-best XGBoost model from the model-parameter study (`max_depth=3, eta=0.05,
+min_child_weight=10, gamma=1, lambda=1, max_delta_step=1, subsample=0.8, colsample_bytree=0.6`). Each
+split varies the tier-aware image-level split knobs (test fractions, tier weights, the critical
+floor, the random seed); for every split the model is re-tuned for `nrounds` with image-grouped
+`xgb.cv` and then evaluated on **that split's own held-out test images**.
+
+> **Read this differently from the model report.** There, all models shared one test set, so the
+> numbers were directly comparable. Here **every scenario has a different held-out test set**, so a
+> higher critical recall can mean "a better split *strategy*" *or* simply "easier images happened to
+> land in test." The same-config / different-seed replicates **S1, S9, S10** exist precisely to
+> measure that noise floor — read them together before trusting any single gap (see §6; the
+> optimiser turns out seed-stable, so that floor reflects model-training stochasticity). The dataset
+> is Tumor-dominated (`AccuracyNull ≈ 0.84`), so we still rank on **critical-class recall**, not raw
+> accuracy.
+
+# 1. The split knobs being varied
+
+The held-out test set is built at the **image level** (all cells of an image go to one side). These
+are the knobs the grid sweeps:
+
+- **`tier_test_frac`** (e.g. `critical = 0.30, medium = 0.25, non_critical = 0.20`) — share of each
+  tier's cells *targeted* for the test set. Raising the critical fraction puts more rare cells in
+  test (more stable recall estimate, fewer rare cells left to train on).
+- **`tier_weight`** (e.g. `critical = 40, medium = 10, non_critical = 1`) — how hard the optimiser
+  tries to hit each tier's target. A critical mismatch is penalised `weight×` harder; `equal weights`
+  removes tier priority entirely.
+- **`min_test_count`** (e.g. `critical = 8`) — a hard **floor**: at least this many critical cells per
+  type must land in test, otherwise that class's sensitivity is unestimable.
+- **`seed`** — the random restart seed of the split optimiser. With image-level splitting and ~27
+  images, the seed alone moves which images are tested and therefore the measured recall.
+
+# 2. The split-combination grid
+
+```{r grid-table}
+knitr::kable(split_grid, caption = "Grid varied only the split params; model (M9) + cleaning held constant")
+```
+
+```{r fixed-model}
+knitr::kable(as.data.frame(best_xgb),
+             caption = "Fixed model across all 10 splits: M9 'conservative' XGBoost params")
+```
+
+# 3. Scenario results (sorted by critical-class recall)
+
+Test cells/images now vary per scenario, so they are shown alongside the metrics. Differences across
+rows mix split strategy with test-set composition — see the seed replicates in §6.
+
+```{r scenario-table}
+tab <- res |>
+  dplyr::arrange(dplyr::desc(Sensitivity_critical_mean_test)) |>
+  dplyr::transmute(
+    scenario_label,
+    Accuracy_test  = r3(Accuracy_test),
+    Kappa_test     = r3(Kappa_test),
+    Sens_crit_test = r3(Sensitivity_critical_mean_test),
+    F1_crit_test   = r3(F1_critical_mean_test),
+    n_test_cells, n_test_images, nrounds_best)
+knitr::kable(tab, caption = "Held-out test metrics per split scenario (best = top)")
+```
+
+# 4. Per-class critical sensitivity (recall) matrix
+
+```{r sens-matrix}
+sens_cols <- paste0("Sens_", critical, "_test")
+m <- res[, c("scenario_label", sens_cols)]
+colnames(m) <- c("scenario", critical)
+m[critical] <- lapply(m[critical], r3)
+m <- m[order(-rowMeans(sapply(m[critical], as.numeric), na.rm = TRUE)), ]
+knitr::kable(m, row.names = FALSE,
+             caption = "Per-class test recall for the 6 critical cell types (higher = better)")
+```
+
+# 5. Per-iteration detail
+
+```{r iterations, results='asis'}
+analyse_row <- function(r) {
+  sv <- as.numeric(r[paste0("Sens_", critical, "_test")]); names(sv) <- critical
+  missed <- names(sv)[!is.na(sv) & sv < 0.5]
+  msgs <- c()
+  if (length(missed)) msgs <- c(msgs, paste0("missed (recall<0.5): ", paste(missed, collapse = ", ")))
+  if (r$Accuracy_test - r$AccuracyNull_test < 0.05)
+    msgs <- c(msgs, "accuracy barely above the majority-Tumor null — leaning on the dominant class")
+  if (r$Precision_critical_mean_test < r$Sensitivity_critical_mean_test - 0.1)
+    msgs <- c(msgs, "critical classes over-predicted (precision < recall)")
+  if (!length(msgs)) msgs <- "no critical class below recall 0.5; balanced precision/recall"
+  paste(msgs, collapse = "; ")
+}
+
+ord <- order(-res$Sensitivity_critical_mean_test)
+for (i in ord) {
+  r <- res[i, ]
+  cat(sprintf("\n\n## %s — %s\n\n", r$model_id, r$scenario_label))
+
+  cat("**Split params (test-fraction targets / weights / floor)**\n\n")
+  print(knitr::kable(data.frame(
+    tier      = c("critical", "medium", "non_critical"),
+    test_frac = c(r$tier_test_frac_critical, r$tier_test_frac_medium, r$tier_test_frac_noncrit),
+    weight    = c(r$tier_weight_critical, r$tier_weight_medium, r$tier_weight_noncrit),
+    min_test  = c(r$min_test_count_critical, 5, 0), row.names = NULL)))
+  cat(sprintf("\n\nseed = %s | Train %d cells / Test %d cells across %d test images.\n\n",
+              r$seed, r$n_train_cells, r$n_test_cells, r$n_test_images))
+
+  sp <- split_store[[r$model_id]]
+  if (!is.null(sp)) {
+    cat("\n**Achieved split** (per-class counts and achieved test fraction)\n\n")
+    print(knitr::kable(sp))
+  }
+
+  cat("\n\n**Test metrics**\n\n")
+  print(knitr::kable(data.frame(
+    Accuracy = r3(r$Accuracy_test), Kappa = r3(r$Kappa_test),
+    Lower = r3(r$AccuracyLower_test), Upper = r3(r$AccuracyUpper_test),
+    Null = r3(r$AccuracyNull_test), Sens_crit = r3(r$Sensitivity_critical_mean_test),
+    F1_crit = r3(r$F1_critical_mean_test), nrounds_best = r$nrounds_best, row.names = NULL)))
+
+  cm <- cm_store[[r$model_id]]
+  if (!is.null(cm)) {
+    cat("\n\n**Confusion matrix** (rows = Prediction, cols = Reference)\n\n")
+    print(knitr::kable(as.data.frame.matrix(cm)))
+  }
+  cat("\n\n**Analysis:** ", analyse_row(r), "\n\n")
+}
+```
+
+# 6. Split-noise floor — seed replicates (S1 / S9 / S10)
+
+S1, S9 and S10 are the **same split config** (frac 0.30/0.25/0.20, weights 40/10/1, floor 8) at
+seeds 42 / 7 / 123. The tier-aware optimiser is **seed-stable** — all three converge to the *same*
+held-out images (identical `n_test_cells` / `n_test_images` below) — so the residual spread in
+critical recall is **model-training stochasticity** (XGBoost row/column subsampling), not split
+variation. Either way it sets the **noise floor**: any cross-split gain smaller than this is not
+real.
+
+```{r seed-variance}
+rep_ids <- c("S1", "S9", "S10")
+rep_rows <- res[res$model_id %in% rep_ids, ]
+sc <- rep_rows$Sensitivity_critical_mean_test
+seedtab <- rep_rows |>
+  dplyr::transmute(scenario_label, seed,
+    Acc = r3(Accuracy_test), Kappa = r3(Kappa_test),
+    Sens_crit = r3(Sensitivity_critical_mean_test), F1_crit = r3(F1_critical_mean_test),
+    n_test_cells, n_test_images)
+knitr::kable(seedtab, caption = "Same split config, three seeds — the estimate's noise floor")
+cat(sprintf("\nCritical-recall across seeds: mean = %.3f, range = %.3f (%.3f–%.3f), sd = %.3f.\n",
+            mean(sc), max(sc) - min(sc), min(sc), max(sc), sd(sc)))
+```
+
+# 7. Conclusion — best split
+
+```{r conclusion, results='asis'}
+acc_floor <- 0.93; kappa_floor <- 0.85
+elig <- res[res$Accuracy_test >= acc_floor & res$Kappa_test >= kappa_floor, ]
+elig <- elig[order(-elig$Sensitivity_critical_mean_test, -elig$F1_critical_mean_test,
+                   -elig$Kappa_test), ]
+best <- res[res$model_id == best_s_id, ][1, ]
+base <- res[res$model_id == "S1", ][1, ]
+sc_rep <- res$Sensitivity_critical_mean_test[res$model_id %in% c("S1", "S9", "S10")]
+noise <- max(sc_rep) - min(sc_rep)
+
+cat(sprintf(
+"**Guardrail:** Accuracy_test ≥ %.2f and Kappa_test ≥ %.2f → %d/%d splits eligible (%s).\n\n",
+acc_floor, kappa_floor, nrow(elig), nrow(res), paste(elig$model_id, collapse = ", ")))
+
+cat(sprintf(
+"**Selected split: %s — %s**\n\n- Held-out test: Accuracy = %.3f, Kappa = %.3f (null = %.3f)\n- Critical-class recall = %.3f (baseline S1 = %.3f, Δ = %+.3f); seed-noise floor ≈ %.3f\n- Split: critical test_frac = %.2f, critical weight = %s, critical floor = %s, seed = %s\n- Test set: %d cells / %d images; model re-tuned to nrounds = %s\n\n",
+best$model_id, best$scenario_label,
+best$Accuracy_test, best$Kappa_test, best$AccuracyNull_test,
+best$Sensitivity_critical_mean_test, base$Sensitivity_critical_mean_test,
+best$Sensitivity_critical_mean_test - base$Sensitivity_critical_mean_test, noise,
+best$tier_test_frac_critical, best$tier_weight_critical, best$min_test_count_critical,
+best$seed, best$n_test_cells, best$n_test_images, best$nrounds_best))
+```
+
+```{r delta-vs-baseline}
+sens_cols <- paste0("Sens_", critical, "_test")
+delta <- data.frame(class = critical,
+                    baseline_S1 = r3(base[sens_cols]),
+                    best        = r3(best[sens_cols]))
+delta$delta <- round(delta$best - delta$baseline_S1, 3)
+knitr::kable(delta[order(delta$delta), ], row.names = FALSE,
+             caption = "Per-critical-class recall: best split vs baseline S1")
+```
+
+**Takeaways**
+
+- The model is identical in every row, so this report is about the **evaluation split**, not the
+  classifier. Treat the "best split" as the configuration that yields the most trustworthy rare-cell
+  estimate, not a better model.
+- Any cross-split gap **smaller than the seed-noise floor (§6)** is not meaningful — it is just which
+  images landed in test. Prefer configs that are both high *and* well-populated in the critical tier.
+- Watch the achieved-split tables (§5): a split that leaves a critical class below its
+  `min_test_count` makes that class's recall unestimable, regardless of the headline number.
+- If a high critical fraction (e.g. S2's 0.40) inflates test recall but starves training of rare
+  cells, that is a warning, not a win — confirm against the production split (S1).
+```

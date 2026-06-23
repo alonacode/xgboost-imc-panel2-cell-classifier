@@ -1,0 +1,276 @@
+---
+title: "XGBoost permutation sweep — model, split & knob params"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: kable
+    self_contained: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.align = "center", dpi = 110)
+suppressMessages({ library(dplyr); library(tidyr); library(ggplot2); library(knitr); library(scales) })
+
+rout <- "/Users/svitlanamoiseyenko/Repos/genomic/xgboost-imc-panel2-cell-classifier/XGBoost_classifier/Panel_2_10/Rout"
+cfg   <- read.csv(file.path(rout, "tuning_results.csv"),          check.names = FALSE) |> distinct(model_id, .keep_all = TRUE)
+spl   <- read.csv(file.path(rout, "tuning_results_split.csv"),    check.names = FALSE)
+splv2 <- read.csv(file.path(rout, "tuning_results_split_v2.csv"), check.names = FALSE)
+sel   <- readRDS("selected_reference.rds")   # the selected reference version
+
+short <- function(x) sub("^[a-z]+_[0-9]+ \\(", "", sub("\\)$", "", x))
+acc_fill <- "#4575b4"; crit_fill <- "#d73027"; base_col <- "#1a9850"; sel_col <- "#7b3294"
+s_crit <- sel$metrics$Sensitivity_critical_mean_test
+s_kap  <- sel$metrics$Kappa_test
+
+base_cfg  <- cfg |> filter(model_id == "M1")
+best_cfg  <- cfg |> filter(grepl("^M", model_id)) |> arrange(desc(Sensitivity_critical_mean_test)) |> slice(1)
+best_spl  <- bind_rows(spl, splv2) |> arrange(desc(Sensitivity_critical_mean_test)) |> slice(1)
+```
+
+## Summary
+
+The reference model is the **selected version**: an XGBoost classifier with an **adaptive
+train/test split** (auto-tuned label-weights + seed search) and a **12-model CV grid** for
+hyperparameters. This report runs a permutation sweep over **three parameter families** and lets
+each family "vote" for its best setting, to see whether any combination beats the selected version.
+
+- **Model param** — `r nrow(filter(cfg, grepl("^M", model_id)))` hyperparameter variants (M1–M10), on a fixed split.
+- **Split (train/test) param** — `r nrow(spl)` directed variants (S1–S10) + a `r nrow(splv2)`-cell grid (V1–V27: test-frac × critical-weight × min-count floor).
+- **Knob param** — `r nrow(filter(cfg, grepl("^A", model_id)))` data/weighting ablations (A1–A4).
+
+> **Reading the metrics.** Overall **Accuracy** is dominated by the Tumor majority. The real
+> tuning target is **critical-class recall** (mean sensitivity over the rare types: MDSC, BnT, Igg,
+> mregDC, PMN_MDSC, Neutrophil) and **Kappa**. **Caveat:** the selected version and each split
+> permutation use *different* held-out sets, so metrics are **indicative, not strictly comparable**;
+> the selected version's tiny rare-class test counts (below) inflate its rare-class recall. Only the
+> M1–M10 model-param variants share one fixed split and are mutually comparable.
+
+### How the sweep works — voting across three families
+
+```{r voting-fig, fig.width=10, fig.height=5}
+fam <- data.frame(
+  ymin = c(2.55, 1.55, 0.55), ymax = c(3.3, 2.3, 1.3),
+  family = c("MODEL PARAM", "SPLIT (TRAIN/TEST) PARAM", "KNOB PARAM"),
+  vote = c(
+    paste0("winner: + max_delta_step (", best_cfg$model_id, ")\ncritical recall ",
+           round(best_cfg$Sensitivity_critical_mean_test, 2), "  (best on fixed split)"),
+    "winner: frac 0.20 · weight 40-100 · floor >= 8\nstable rare-class testing",
+    "winner: keep inverse-freq weights\n(no ablation improves rare classes)"),
+  fill = c("#2c7fb8", "#d95f0e", "#31a354"))
+ggplot() +
+  annotate("text", x = 2.9, y = 3.65, label = "VOTING ACROSS PERMUTATION FAMILIES",
+           fontface = "bold", size = 4.3, color = "grey20") +
+  geom_rect(data = fam, aes(xmin = 0.15, xmax = 2.25, ymin = ymin, ymax = ymax, fill = fill),
+            color = "white", alpha = .93) +
+  geom_text(data = fam, aes(x = 1.2, y = (ymin + ymax)/2 + 0.16, label = family),
+            color = "white", fontface = "bold", size = 3.7) +
+  geom_text(data = fam, aes(x = 1.2, y = (ymin + ymax)/2 - 0.14, label = vote),
+            color = "white", size = 2.75, lineheight = .92) +
+  annotate("segment", x = 2.25, xend = 3.45, y = c(2.92, 1.92, 0.92), yend = 1.95,
+           arrow = arrow(length = unit(7, "pt"), type = "closed"), color = "grey45", linewidth = .7) +
+  annotate("text", x = 2.85, y = 2.62, label = "votes", size = 2.7, color = "grey45", fontface = "italic") +
+  geom_rect(aes(xmin = 3.45, xmax = 5.75, ymin = 1.1, ymax = 2.8), fill = "#756bb1", color = "white") +
+  geom_text(aes(x = 4.6, y = 1.95,
+                label = "RECOMMENDED XGBoost\n\n+ max_delta_step\n+ rare-class test floor >= 8\n+ inverse-freq weights"),
+            color = "white", fontface = "bold", size = 3.2, lineheight = 1.05) +
+  scale_fill_identity() + xlim(0, 5.9) + ylim(0.4, 3.85) + theme_void()
+```
+
+### Critical-class recall scorecard
+
+```{r scorecard-fig, fig.width=9, fig.height=3.4}
+sc <- data.frame(
+  who = c("Selected (reference)", "M1 baseline (fixed split)",
+          paste0("Best model param (", best_cfg$model_id, ")"), "Best split variant"),
+  crit = c(s_crit, base_cfg$Sensitivity_critical_mean_test,
+           best_cfg$Sensitivity_critical_mean_test, best_spl$Sensitivity_critical_mean_test))
+sc$who <- reorder(sc$who, sc$crit)
+ggplot(sc, aes(crit, who, fill = crit)) +
+  geom_col(width = .62) +
+  geom_text(aes(label = sprintf("%.3f", crit)), hjust = 1.12, color = "white", fontface = "bold", size = 3.6) +
+  scale_fill_gradient(low = "#fdae61", high = "#1a9850", guide = "none") +
+  coord_cartesian(xlim = c(0, 1)) +
+  theme_bw(base_size = 11) +
+  labs(x = "Critical-class recall", y = NULL, title = "Critical-class recall scorecard",
+       subtitle = "Different test sets — indicative comparison")
+```
+
+## Selected reference version
+
+```{r sel-cfg}
+data.frame(
+  component = c("Split protocol", "default / rare test frac", "rare threshold", "best seed",
+               "test images / cells", "min rare-class test cells",
+               "Model param grid", "selected (max_depth / eta / min_child_weight / nrounds)"),
+  value = c(sel$split$scheme,
+            paste0(sel$split$default_test_frac, " / ", sel$split$rare_test_frac),
+            paste0("< ", sel$split$rare_threshold, " cells = rare"),
+            sel$split$best_seed,
+            paste0(sel$split$n_test_images, " / ", format(sel$split$n_test_cells, big.mark = ",")),
+            sel$split$min_test_count_observed,
+            sel$config$grid,
+            paste0(sel$config$max_depth, " / ", sel$config$eta, " / ",
+                   sel$config$min_child_weight, " / ", sel$config$nrounds_best))
+) |> kable(caption = "Selected version configuration (reproduced on the cached cells)")
+```
+
+```{r sel-crit}
+data.frame(class = names(sel$crit_sens),
+           sensitivity = round(as.numeric(sel$crit_sens), 3)) |>
+  kable(caption = "Selected version critical-class recall — note the tiny test counts behind the 1.000s")
+```
+
+The selected version reaches **critical recall `r round(s_crit,3)`**, **Kappa `r round(s_kap,3)`**,
+balanced accuracy `r round(sel$metrics$BalancedAccuracy_macro_test,3)`. But its adaptive split leaves
+as few as **`r sel$split$min_test_count_observed` cells** for some rare classes in the test set, so
+several class sensitivities are 1.000 over 2–3 cells — high but high-variance. Its chosen config is a
+flexible **depth-`r sel$config$max_depth`** tree with no extra regularization; the permutation study
+below tests whether added regularization and a guaranteed rare-class test floor do better.
+
+## Model param permutation (M1–M10)
+
+Same split (`split_main`), varying XGBoost hyperparameters. Sorted by critical-class recall.
+
+```{r cfg-tab}
+cfg |> filter(grepl("^M", model_id)) |>
+  transmute(model_id, config = short(scenario_label),
+            max_depth, eta, gamma, lambda, max_delta_step, nrounds = nrounds_best,
+            Accuracy = round(Accuracy_test, 3), Kappa = round(Kappa_test, 3),
+            `BalAcc` = round(BalancedAccuracy_macro_test, 3),
+            `Crit recall` = round(Sensitivity_critical_mean_test, 3)) |>
+  arrange(desc(`Crit recall`)) |>
+  kable(caption = "Model-param variants (test set), sorted by critical-class recall")
+```
+
+```{r cfg-fig, fig.width=9, fig.height=4.6}
+d <- cfg |> filter(grepl("^M", model_id)) |>
+  mutate(lab = paste0(model_id, " · ", short(scenario_label)),
+         lab = reorder(lab, Sensitivity_critical_mean_test),
+         is_base = model_id == "M1")
+base_v <- d$Sensitivity_critical_mean_test[d$model_id == "M1"]
+ggplot(d, aes(Sensitivity_critical_mean_test, lab)) +
+  geom_vline(xintercept = base_v, linetype = "dashed", color = base_col) +
+  geom_vline(xintercept = s_crit, linetype = "dotted", color = sel_col, linewidth = 0.9) +
+  annotate("text", x = s_crit, y = Inf, label = "Selected", color = sel_col, size = 3,
+           hjust = -0.05, vjust = 1.5) +
+  geom_segment(aes(x = base_v, xend = Sensitivity_critical_mean_test, yend = lab), color = "grey70") +
+  geom_point(aes(color = is_base), size = 4) +
+  scale_color_manual(values = c(`TRUE` = base_col, `FALSE` = crit_fill), guide = "none") +
+  theme_bw(base_size = 11) +
+  labs(x = "Critical-class recall (test)", y = NULL,
+       title = "Model param: M1 baseline (green) vs Selected reference (purple)",
+       subtitle = "M1–M10 share one fixed split; the selected version is on its own (rare-sparse) split — see caveat")
+```
+
+**Takeaway:** on the fixed split, `r best_cfg$model_id` (`r short(best_cfg$scenario_label)`) gives the
+best rare-class recall (`r round(best_cfg$Sensitivity_critical_mean_test,3)` vs M1 baseline
+`r round(base_cfg$Sensitivity_critical_mean_test,3)`). Deeper/heavily-regularized trees (M5, M8) push
+overall accuracy up but *drop* rare recall — the majority-class trap. The selected version's own
+number (`r round(s_crit,3)`) sits above the M-grid, but that reflects its depth-`r sel$config$max_depth`
+config **and** its small rare-class test sample; the same config family without `max_delta_step` lands
+near M8 on the fixed split (`r round(cfg$Sensitivity_critical_mean_test[cfg$model_id=="M8"],3)`).
+
+## Split (train/test) param permutation
+
+The split changes which images/cells are held out, so accuracy is not comparable; we judge splits by
+**critical-class recall** and **rare-class coverage** (`min_test_count_observed` — the smallest number
+of test cells any critical class gets).
+
+### Directed sweep (S1–S10)
+
+```{r spl-fig, fig.width=9, fig.height=4.6}
+s <- spl |>
+  mutate(lab = paste0(model_id, " · ", short(scenario_label)),
+         lab = reorder(lab, Sensitivity_critical_mean_test),
+         is_base = model_id == "S1")
+base_s <- s$Sensitivity_critical_mean_test[s$model_id == "S1"]
+ggplot(s, aes(Sensitivity_critical_mean_test, lab)) +
+  geom_vline(xintercept = base_s, linetype = "dashed", color = base_col) +
+  geom_vline(xintercept = s_crit, linetype = "dotted", color = sel_col, linewidth = 0.9) +
+  annotate("text", x = s_crit, y = Inf, label = paste0("Selected (floor=", sel$split$min_test_count_observed, ")"),
+           color = sel_col, size = 3, hjust = 1.05, vjust = 1.5) +
+  geom_point(aes(color = is_base, size = min_test_count_observed)) +
+  scale_color_manual(values = c(`TRUE` = base_col, `FALSE` = crit_fill), guide = "none") +
+  scale_size(range = c(2, 7), name = "min rare\ntest cells") +
+  theme_bw(base_size = 11) +
+  labs(x = "Critical-class recall (test)", y = NULL,
+       title = "Split variants (green = S1) vs Selected reference (purple)",
+       subtitle = "Point size = rare-class coverage; the selected split has only 2 cells for the rarest class")
+```
+
+### Full grid (V1–V27): frac × critical-weight × floor
+
+```{r splv2-fig, fig.width=9.5, fig.height=4}
+g <- splv2 |>
+  mutate(frac = paste0("test frac ", tier_test_frac_critical),
+         w = factor(tier_weight_critical, levels = c(1, 40, 100)),
+         floor = factor(min_test_count_critical, levels = c(0, 8, 15)))
+ggplot(g, aes(w, floor, fill = Sensitivity_critical_mean_test)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.2f", Sensitivity_critical_mean_test)), size = 3) +
+  facet_wrap(~frac) +
+  scale_fill_gradient2(low = "#4575b4", mid = "#ffffbf", high = "#d73027",
+                       midpoint = median(g$Sensitivity_critical_mean_test), name = "crit\nrecall") +
+  theme_minimal(base_size = 11) +
+  labs(x = "critical-class up-weight", y = "min test-count floor",
+       title = "Critical-class recall across the split grid")
+```
+
+**Takeaway:** the strongest, most reproducible rare-class recall comes from **test-frac 0.20 with a
+non-trivial floor (≥8)** and moderate-to-high critical up-weight (grid cells V5/V8/V7 ≈ 0.82–0.86). A
+zero floor starves rare classes in the test set, and test-frac 0.40 spreads them too thin — both
+degrade the estimate. The selected split sits near the good region but with too low a floor.
+
+## Knob param permutation (A1–A4)
+
+These change the **data or class weights**, not the tree hyperparameters (all use the M1 config).
+
+```{r abl-tab}
+cfg |> filter(grepl("^A", model_id)) |>
+  transmute(model_id, knob = short(scenario_label),
+            Accuracy = round(Accuracy_test, 3), Kappa = round(Kappa_test, 3),
+            BalAcc = round(BalancedAccuracy_macro_test, 3),
+            `Crit recall` = round(Sensitivity_critical_mean_test, 3)) |>
+  kable(caption = "Knob (ablation) variants vs baseline M1")
+```
+
+```{r abl-fig, fig.width=9, fig.height=4}
+ab <- cfg |> filter(model_id %in% c("M1") | grepl("^A", model_id)) |>
+  transmute(variant = ifelse(model_id == "M1", "M1 baseline", short(scenario_label)),
+            `Crit recall` = Sensitivity_critical_mean_test, Kappa = Kappa_test) |>
+  pivot_longer(-variant, names_to = "metric", values_to = "value") |>
+  mutate(variant = reorder(variant, value))
+ggplot(ab, aes(value, variant, fill = metric)) +
+  geom_col(position = position_dodge(width = .75), width = .7) +
+  geom_text(aes(label = sprintf("%.3f", value)), position = position_dodge(width = .75),
+            hjust = 1.05, size = 3, color = "white") +
+  scale_fill_manual(values = c(`Crit recall` = crit_fill, Kappa = acc_fill)) +
+  theme_bw(base_size = 11) +
+  labs(x = NULL, y = NULL, fill = NULL, title = "Knob params vs baseline")
+```
+
+**Takeaway:** every knob (capping weights, dropping `undefined`, area QC, outlier removal) *raises*
+Kappa/accuracy but *lowers* critical recall — they trade rare-class sensitivity for cleaner
+majority-class fit. None win the vote on the metric that matters here.
+
+## Conclusion — what wins the vote
+
+- **Model param:** the selected CV grid picks a flexible **depth-`r sel$config$max_depth`** tree with no
+  extra regularization. On a fixed, fairly-sampled split the sweep shows that adding `max_delta_step`
+  (`r best_cfg$model_id`) is what actually lifts rare-class recall
+  (`r round(best_cfg$Sensitivity_critical_mean_test,3)`); deeper trees alone (M5/M8) raise accuracy but
+  not rare recall. **Vote: add `max_delta_step`.**
+- **Split (train/test) param:** the selected adaptive split is sound on overall metrics but leaves only
+  **`r sel$split$min_test_count_observed` test cells** for the rarest classes, so its rare-class recall
+  is high-variance. **Vote: keep test-frac 0.20 + critical weight 40–100, add a rare-class test floor ≥ 8.**
+- **Knob param:** none improve rare-class recall — they trade it for headline accuracy. **Vote: keep the
+  inverse-frequency weighting (undefined/10, Igg/30).**
+
+*Net: the selected version is strong (Kappa `r round(s_kap,3)`, balanced accuracy
+`r round(sel$metrics$BalancedAccuracy_macro_test,3)`), but its rare-class evaluation is under-powered.
+The two upgrades that win the vote are **`max_delta_step` in the model param** and a **rare-class
+test-count floor in the split** — neither is in the current pipeline.*

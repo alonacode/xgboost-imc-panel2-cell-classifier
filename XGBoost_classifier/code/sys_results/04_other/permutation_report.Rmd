@@ -1,0 +1,122 @@
+---
+title: "Label-permutation test — 0.994 classifier"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 4)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+```
+
+```{r load}
+# Outputs produced by permutation_build.R (run that Rscript first).
+base_path <- "/Users/svitlanamoiseyenko/Repos/genomic/xgboost-imc-panel2-cell-classifier/XGBoost_classifier/Panel_2_10"
+rds_path  <- file.path(base_path, "ROut", "permutation_null.rds")
+stopifnot(file.exists(rds_path))
+
+perm <- readRDS(rds_path)
+null_df  <- perm$null
+observed <- perm$observed
+pvalues  <- perm$pvalues
+cfg      <- perm$config
+```
+
+## What this is
+
+The held-out **test accuracy (~0.994)** is inflated by Tumor dominance: the no-information rate
+(NIR) is ~0.87, so a "predict Tumor for everything" model already scores ~0.87. To check whether the
+classifier learns **real marker → cell-type structure** (and not just the class imbalance), we
+shuffled the `cell_labels`, refit the *same* estimator, and repeated it
+**`r cfg$N_PERM`** times (`null_type = "`r cfg$null_type`"`) to build a **null distribution** for
+each metric. Everything except the labels was held fixed: the train/test image split, the CV folds,
+and the tuned params (`max_depth=`r cfg$params_best$max_depth`, eta=`r cfg$params_best$eta`,
+min_child_weight=`r cfg$params_best$min_child_weight`, nrounds=`r cfg$best_nrounds`).
+
+`r cfg$n_train_cells` train cells / `r cfg$n_test_cells` test cells, `r cfg$num_classes` classes.
+
+## p-values
+
+One-sided empirical p-value `p = (1 + #{null >= observed}) / (N + 1)`. Smallest achievable here is
+`r round(1/(cfg$N_PERM + 1), 4)`.
+
+```{r pval-table}
+knitr::kable(pvalues, digits = 4)
+```
+
+## Null distributions vs observed
+
+Read these top-to-bottom: **accuracy's null sits near the NIR (~0.87)** — that floor is *why raw
+accuracy is misleading* — while **Kappa and macro-F1 nulls sit near 0**. The observed values
+(dashed red line) landing far in the upper tail is the actual proof the model learned biology.
+
+```{r hist-fn}
+plot_null <- function(metric, title) {
+  if (!metric %in% names(null_df)) return(invisible(NULL))
+  obs <- observed[[metric]]
+  ggplot(data.frame(value = null_df[[metric]]), aes(value)) +
+    geom_histogram(bins = 30, fill = "grey75", color = "white") +
+    geom_vline(xintercept = obs, color = "red3", linetype = "dashed", linewidth = 1) +
+    annotate("text", x = obs, y = Inf, label = sprintf("observed = %.3f", obs),
+             vjust = 1.5, hjust = 1.05, color = "red3", size = 3.5) +
+    labs(title = title, x = metric, y = "permutations") +
+    theme_bw()
+}
+```
+
+### Held-out test
+
+```{r hist-test, fig.height=3.4}
+plot_null("Accuracy_test", "Test accuracy — null vs observed (null ~ NIR)")
+plot_null("Kappa_test",    "Test Kappa — null vs observed (null ~ 0)")
+plot_null("F1_macro_test", "Test macro-F1 — null vs observed (null ~ 0)")
+```
+
+### Cross-validation (out-of-fold)
+
+```{r hist-cv, fig.height=3.4, eval=isTRUE(cfg$DO_CV)}
+plot_null("Accuracy_cv", "CV accuracy — null vs observed")
+plot_null("Kappa_cv",    "CV Kappa — null vs observed")
+plot_null("F1_macro_cv", "CV macro-F1 — null vs observed")
+```
+
+## Sanity checks
+
+```{r sanity}
+sane <- data.frame(
+  check = c(
+    "null test accuracy ~ NIR (good)",
+    "null test Kappa ~ 0 (good; far from 0 => leak)",
+    "null test macro-F1 ~ 0 (good)"
+  ),
+  null_mean = c(
+    round(mean(null_df$Accuracy_test, na.rm = TRUE), 3),
+    round(mean(null_df$Kappa_test,    na.rm = TRUE), 3),
+    round(mean(null_df$F1_macro_test, na.rm = TRUE), 3)
+  ),
+  reference = c(round(observed$AccuracyNull_test, 3), 0, 0)
+)
+knitr::kable(sane)
+```
+
+## Conclusion
+
+```{r conclusion, results='asis'}
+acc_p   <- pvalues$p_value[pvalues$metric == "Accuracy_test"]
+kappa_p <- pvalues$p_value[pvalues$metric == "Kappa_test"]
+f1_p    <- pvalues$p_value[pvalues$metric == "F1_macro_test"]
+cat(sprintf(
+"- Observed test accuracy %.3f vs null mean %.3f (p = %.4f).\n",
+  observed$Accuracy_test, mean(null_df$Accuracy_test, na.rm = TRUE), acc_p))
+cat(sprintf(
+"- Observed test Kappa %.3f vs null mean %.3f (p = %.4f).\n",
+  observed$Kappa_test, mean(null_df$Kappa_test, na.rm = TRUE), kappa_p))
+cat(sprintf(
+"- Observed test macro-F1 %.3f vs null mean %.3f (p = %.4f).\n",
+  observed$F1_macro_test, mean(null_df$F1_macro_test, na.rm = TRUE), f1_p))
+cat("\nThe model's performance is **not** explained by the Tumor imbalance: under shuffled labels ",
+    "the best it can do is predict Tumor (accuracy ~ NIR, Kappa/macro-F1 ~ 0). Kappa and macro-F1, ",
+    "not raw accuracy, are the metrics that demonstrate the real learned signal.\n", sep = "")
+```

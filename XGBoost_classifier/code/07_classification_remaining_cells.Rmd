@@ -1,0 +1,572 @@
+---
+title: "classification all the remaining cells"
+---
+
+```{r, include=FALSE}
+.libPaths("/home/ubuntu/R/x86_64-pc-linux-gnu-library/4.5")
+
+library(SingleCellExperiment)
+library(SummarizedExperiment)
+library(S4Vectors)
+library(cytomapper)
+library(xgboost)
+```
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+if(Sys.info()["nodename"] == "immucan-server") {
+  base_path <- "/mnt/immucan_volume/processed_data/Panel_2/cell_classification_XTi"
+}
+
+data_out_path <- file.path(base_path, "data", "Rout")
+data_raw_path <- file.path(base_path, "data", "raw")
+```
+
+```{r}
+spe_all <- readRDS(file.path(data_out_path, "spe_all_lab.rds"))
+lab_sce <- readRDS(file.path(data_out_path, "lab_spe.rds"))
+model <- readRDS(file.path(base_path, "classifiers", "XTi_xgboost_classifier.rds"))
+```
+
+```{r}
+images_09 <- readRDS(file.path(data_raw_path, "Panel_2_09", "Rout", "images_09.rds"))
+images_10 <- readRDS(file.path(data_raw_path, "Panel_2_10", "Rout", "images_10.rds"))
+images_12 <- readRDS(file.path(data_raw_path, "Panel_2_12", "Rout", "images_12.rds"))
+
+masks_09 <- readRDS(file.path(data_raw_path, "Panel_2_09", "Rout", "masks_09.rds"))
+masks_10 <- readRDS(file.path(data_raw_path, "Panel_2_10", "Rout", "masks_10.rds"))
+masks_12 <- readRDS(file.path(data_raw_path, "Panel_2_12", "Rout", "masks_12.rds"))
+
+mcols(images_09) <- mcols(masks_09) <-
+  DataFrame(sample_id = names(images_09))
+mcols(images_10) <- mcols(masks_10) <-
+  DataFrame(sample_id = names(images_10))
+mcols(images_12) <- mcols(masks_12) <-
+  DataFrame(sample_id = names(images_12))
+
+image_panels <- list(
+  Panel_2_09 = images_09,
+  Panel_2_10 = images_10,
+  Panel_2_12 = images_12
+)
+
+mask_panels <- list(
+  Panel_2_09 = masks_09,
+  Panel_2_10 = masks_10,
+  Panel_2_12 = masks_12
+)
+```
+
+```{r}
+stopifnot(
+  "exprs" %in% assayNames(spe_all),
+  "exprs" %in% assayNames(lab_sce),
+  all(c("sample_id", "cell_labels") %in% colnames(colData(spe_all))),
+  all(c("sample_id", "cell_labels") %in% colnames(colData(lab_sce)))
+)
+```
+
+
+```{r}
+is_unlabelled <- (
+  is.na(spe_all$cell_labels) |
+    spe_all$cell_labels == "unlabelled"
+)
+
+unlab_sce <- spe_all[, is_unlabelled]
+
+message("Labelled cells: ", ncol(lab_sce))
+message("Unlabelled cells: ", ncol(unlab_sce))
+
+if (!ncol(unlab_sce)) {
+  stop("No unlabelled cells were found.")
+}
+
+stopifnot(
+  !anyNA(lab_sce$cell_labels),
+  all(lab_sce$cell_labels != "unlabelled"),
+  length(intersect(colnames(lab_sce), colnames(unlab_sce))) == 0,
+  setequal(
+    c(colnames(lab_sce), colnames(unlab_sce)),
+    colnames(spe_all)
+  )
+)
+```
+
+
+```{r}
+add_indication <- function(sce) {
+  sample_id <- as.character(sce$sample_id)
+
+  indication <- ifelse(
+    grepl("CLB|USL", sample_id),
+    "GI",
+    "THOR"
+  )
+
+  indication <- ifelse(
+    grepl("DED|NIR", sample_id),
+    "THOR",
+    indication
+  )
+
+  indication <- ifelse(
+    grepl("UROC", sample_id),
+    "GU",
+    indication
+  )
+
+  sce$Indication <- indication
+  sce
+}
+
+unlab_sce_for_prediction <- add_indication(unlab_sce)
+```
+
+
+```{r}
+# xgboost 1.7.x stores the exact training columns directly on the booster.
+model_features <- model$feature_names
+
+if (is.null(model_features) || !length(model_features)) {
+  stop("The XGBoost model does not contain stored feature names.")
+}
+
+stopifnot(
+  length(model_features) == model$nfeatures,
+  !anyDuplicated(model_features)
+)
+
+indication_columns <- grep(
+  "^Indication",
+  model_features,
+  value = TRUE
+)
+
+marker_names <- setdiff(
+  model_features,
+  indication_columns
+)
+
+missing_query_markers <- setdiff(
+  marker_names,
+  rownames(unlab_sce_for_prediction)
+)
+
+if (length(missing_query_markers)) {
+  stop(
+    "Markers required by the model are missing from spe_all: ",
+    paste(missing_query_markers, collapse = ", ")
+  )
+}
+
+make_X <- function(sce, model_features) {
+  indication_features <- grep(
+    "^Indication",
+    model_features,
+    value = TRUE
+  )
+
+  marker_features <- setdiff(
+    model_features,
+    indication_features
+  )
+
+  X_expr <- t(
+    assay(sce, "exprs")[
+      marker_features,
+      ,
+      drop = FALSE
+    ]
+  )
+
+  indication <- as.character(sce$Indication)
+
+  X_ind <- vapply(
+    indication_features,
+    function(feature) {
+      level <- sub("^Indication", "", feature)
+      as.numeric(indication == level)
+    },
+    numeric(length(indication))
+  )
+
+  X_ind <- as.matrix(X_ind)
+  colnames(X_ind) <- indication_features
+  rownames(X_ind) <- colnames(sce)
+
+  X <- cbind(X_expr, X_ind)
+  X <- X[, model_features, drop = FALSE]
+  storage.mode(X) <- "double"
+
+  stopifnot(
+    identical(colnames(X), model_features),
+    ncol(X) == length(model_features),
+    !anyNA(X)
+  )
+
+  X
+}
+
+X_unlabelled <- make_X(
+  unlab_sce_for_prediction,
+  model_features = model_features
+)
+```
+
+
+```{r}
+# Reproduce the class mapping from 04_train_classifier.Rmd:
+# y_true <- factor(train_sce$cell_labels)
+# label_mapping <- levels(y_true)
+label_mapping <- levels(
+  factor(as.character(lab_sce$cell_labels))
+)
+
+num_classes <- length(label_mapping)
+
+stopifnot(
+  !anyNA(label_mapping),
+  num_classes == model$params$num_class
+)
+```
+
+# prediction helper
+
+```{r}
+predict_probabilities <- function(model, X, label_mapping) {
+  raw_prediction <- predict(
+    model,
+    newdata = xgboost::xgb.DMatrix(X)
+  )
+
+  if (!is.null(dim(raw_prediction))) {
+    probability_matrix <- as.matrix(raw_prediction)
+  } else {
+    by_row <- matrix(
+      raw_prediction,
+      ncol = length(label_mapping),
+      byrow = TRUE
+    )
+
+    by_column <- matrix(
+      raw_prediction,
+      ncol = length(label_mapping),
+      byrow = FALSE
+    )
+
+    row_error <- mean(abs(rowSums(by_row) - 1))
+    column_error <- mean(abs(rowSums(by_column) - 1))
+
+    probability_matrix <- if (row_error <= column_error) {
+      by_row
+    } else {
+      by_column
+    }
+  }
+
+  if (nrow(probability_matrix) != nrow(X)) {
+    stop("Prediction matrix has the wrong number of cells.")
+  }
+
+  if (ncol(probability_matrix) != length(label_mapping)) {
+    stop(
+      "The model returned ", ncol(probability_matrix),
+      " classes, but ", length(label_mapping),
+      " labels were reconstructed from lab_sce."
+    )
+  }
+
+  colnames(probability_matrix) <- label_mapping
+  rownames(probability_matrix) <- rownames(X)
+
+  probability_matrix
+}
+
+
+```
+
+
+```{r}
+prediction_probability <- predict_probabilities(
+  model,
+  X_unlabelled,
+  label_mapping
+)
+
+predicted_label <- label_mapping[
+  max.col(prediction_probability, ties.method = "first")
+]
+
+```
+
+
+
+
+```{r}
+# Assign model labels to the previously unlabelled object.
+unlab_sce$cell_labels <- predicted_label
+
+# Record where each label came from, using the same colData columns in both
+# objects so that they can be combined directly.
+lab_sce$label_source <- "manual"
+unlab_sce$label_source <- "xgboost"
+
+# Explicitly combine labelled and newly predicted cells.
+spe_all_classified <- cbind(
+  lab_sce,
+  unlab_sce
+)
+
+# cbind places labelled cells first. Restore the original spe_all cell order.
+spe_all_classified <- spe_all_classified[, colnames(spe_all)]
+
+stopifnot(
+  identical(colnames(spe_all_classified), colnames(spe_all)),
+  ncol(spe_all_classified) == ncol(spe_all),
+  !anyNA(spe_all_classified$cell_labels),
+  all(spe_all_classified$cell_labels != "unlabelled")
+)
+```
+
+
+```{r}
+prediction_summary <- data.frame(
+  predicted_label = label_mapping,
+  n_predicted = vapply(
+    label_mapping,
+    function(x) sum(predicted_label == x),
+    integer(1)
+  ),
+  stringsAsFactors = FALSE
+)
+
+classification_results <- list(
+  lab_sce = lab_sce,
+  unlab_sce = unlab_sce,
+  spe_all = spe_all_classified,
+  unlabelled_probability_matrix = prediction_probability,
+  prediction_summary = prediction_summary
+)
+
+prediction_summary
+
+## Final updated object:
+spe_all <- classification_results$spe_all
+```
+
+```{r}
+data_raw_path <- file.path(base_path, "data", "raw")
+
+images_09 <- readRDS(file.path(data_raw_path, "Panel_2_09", "Rout", "images_09.rds"))
+images_10 <- readRDS(file.path(data_raw_path, "Panel_2_10", "Rout", "images_10.rds"))
+images_12 <- readRDS(file.path(data_raw_path, "Panel_2_12", "Rout", "images_12.rds"))
+
+masks_09 <- readRDS(file.path(data_raw_path, "Panel_2_09", "Rout", "masks_09.rds"))
+masks_10 <- readRDS(file.path(data_raw_path, "Panel_2_10", "Rout", "masks_10.rds"))
+masks_12 <- readRDS(file.path(data_raw_path, "Panel_2_12", "Rout", "masks_12.rds"))
+```
+
+# Visual inspection of predicted B cells
+
+```{r plot-predicted-b-cells, fig.height=10, fig.width=12}
+plot_predicted_cells <- function(
+    sce,
+    cell_type,
+    markers,
+    bcg = NULL,
+    normalize_images = TRUE,
+    input_range = c(0, 0.2),
+    sample_ids = NULL,
+    n_samples = 5,
+    seed = 123
+) {
+  cells <- sce[, sce$cell_labels == cell_type]
+
+  if (!ncol(cells)) {
+    stop("No cells predicted as ", cell_type, " were found.")
+  }
+
+  image_names <- unlist(lapply(image_panels, names), use.names = FALSE)
+  mask_names <- unlist(lapply(mask_panels, names), use.names = FALSE)
+
+  available_samples <- intersect(
+    unique(as.character(cells$sample_id)),
+    intersect(image_names, mask_names)
+  )
+
+  if (!length(available_samples)) {
+    stop("No matching images and masks for ", cell_type, ".")
+  }
+
+  if (is.null(sample_ids)) {
+    set.seed(seed)
+
+    selected_samples <- sample(
+      available_samples,
+      min(n_samples, length(available_samples))
+    )
+  } else {
+    selected_samples <- intersect(
+      as.character(sample_ids),
+      available_samples
+    )
+
+    missing_samples <- setdiff(
+      as.character(sample_ids),
+      available_samples
+    )
+
+    if (length(missing_samples)) {
+      warning(
+        "Samples unavailable or without predicted ",
+        cell_type, " cells: ",
+        paste(missing_samples, collapse = ", ")
+      )
+    }
+
+    if (!length(selected_samples)) {
+      stop("None of the requested samples are available.")
+    }
+  }
+
+  if (is.null(bcg)) {
+    bcg <- setNames(
+      rep(list(c(0.2, 8, 1)), length(markers)),
+      markers
+    )
+  }
+
+  missing_bcg <- setdiff(markers, names(bcg))
+
+  if (length(missing_bcg)) {
+    stop(
+      "Missing bcg settings for: ",
+      paste(missing_bcg, collapse = ", ")
+    )
+  }
+
+  bcg <- bcg[markers]
+
+  valid_bcg <- vapply(
+    bcg,
+    function(x) {
+      is.numeric(x) &&
+        length(x) == 3L &&
+        all(is.finite(x))
+    },
+    logical(1)
+  )
+
+  if (!all(valid_bcg)) {
+    stop(
+      "Each bcg value must be numeric c(brightness, contrast, gamma)."
+    )
+  }
+
+  get_selected <- function(panel_list) {
+    selected <- lapply(
+      panel_list,
+      function(panel) {
+        panel[names(panel) %in% selected_samples]
+      }
+    )
+
+    selected <- selected[lengths(selected) > 0]
+    combined <- do.call(c, unname(selected))
+
+    combined[selected_samples]
+  }
+
+  cur_images <- get_selected(image_panels)
+  cur_masks <- get_selected(mask_panels)
+  
+  if (normalize_images) {
+  cur_images <- cytomapper::normalize(
+    cur_images,
+    separateImages = TRUE
+  )
+
+  cur_images <- cytomapper::normalize(
+    cur_images,
+    inputRange = input_range
+  )
+}
+
+  cells <- cells[
+    ,
+    as.character(cells$sample_id) %in% selected_samples
+  ]
+
+  message(
+    "Selected samples: ",
+    paste(selected_samples, collapse = ", ")
+  )
+
+  plotPixels(
+    image = cur_images,
+    mask = cur_masks,
+    object = cells,
+    cell_id = "ObjectNumber",
+    img_id = "sample_id",
+    colour_by = markers,
+    outline_by = "cell_labels",
+    bcg = bcg,
+    colour = list(
+      cell_labels = setNames("white", cell_type)
+    ),
+    thick = TRUE
+  )
+}
+```
+
+
+```{r plot-predicted-b-cells, fig.height=12, fig.width=18}
+plot_predicted_cells(
+  sce = unlab_sce,
+  cell_type = "B",
+  markers = c("CD20", "CD45"),
+  bcg = list(
+    CD20 = c(0, 5, 1),
+    CD45 = c(-0.1, 2, 1)
+  ),
+  normalize_images = TRUE,
+  input_range = c(0, 0.2),
+  n_samples = 5
+)
+```
+
+```{r, fig.height=10, fig.width=15}
+plot_predicted_cells(
+  sce = unlab_sce,
+  cell_type = "BnT",
+  markers = c("CD20", "CD3"),
+  bcg = list(
+    CD20 = c(0, 5, 1),
+    CD3 = c(0, 5, 1)
+  ),
+  normalize_images = TRUE,
+  input_range = c(0, 0.2),
+  n_samples = 5
+)
+```
+
+```{r, fig.height=10, fig.width=15}
+plot_predicted_cells(
+  sce = unlab_sce,
+  cell_type = "Tumor",
+  markers = c("Ecad", "panCK"),
+  bcg = list(
+    Ecad = c(0, 5, 1),
+    panCK = c(-0.1, 2, 1)
+  ),
+  normalize_images = TRUE,
+  input_range = c(0, 0.2),
+  n_samples = 5
+)
+```
+
+

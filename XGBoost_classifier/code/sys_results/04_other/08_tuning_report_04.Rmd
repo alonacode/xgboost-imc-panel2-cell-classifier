@@ -1,0 +1,245 @@
+---
+title: "XGBoost rare-cell tuning — split-parameter report (v2, factorial)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: kable
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(dplyr)
+library(tidyr)
+base_path <- "/Users/svitlanamoiseyenko/Repos/genomic/xgboost-imc-panel2-cell-classifier/XGBoost_classifier/Panel_2_10"
+obj  <- readRDS(file.path(base_path, "ROut", "report_cms_split_v2.rds"))
+res  <- obj$results
+cm_store    <- obj$cm_store
+split_store <- obj$split_store
+split_grid  <- obj$split_grid
+best_xgb    <- obj$best_xgb
+best_s_id   <- obj$best_s_id
+
+critical <- c("MDSC", "BnT", "Igg", "mregDC", "PMN_MDSC", "Neutrophil")
+# stable display order: by index V1..V27
+res <- res[order(suppressWarnings(as.integer(sub("V", "", res$model_id)))), ]
+r3 <- function(x) round(as.numeric(x), 4)
+# short factor handles for the three swept knobs
+res$fracC <- res$tier_test_frac_critical
+res$wC    <- res$tier_weight_critical
+res$floor <- res$min_test_count_critical
+```
+
+# Summary
+
+A **3×3×3 factorial** over the three deterministic split knobs, with the **model held fixed at M9**
+(the guardrail-best XGBoost model: `max_depth=3, eta=0.05, min_child_weight=10, gamma=1, lambda=1,
+max_delta_step=1, subsample=0.8, colsample_bytree=0.6`):
+
+- critical **test-fraction** ∈ {0.20, 0.30, 0.40}
+- critical **weight** ∈ {1, 40, 100}
+- critical **floor** (`min_test_count`) ∈ {0, 8, 15}
+
+= **27 split scenarios (V1–V27)**. Medium/non-critical fractions (0.25 / 0.20), weights (10 / 1) and
+floors (5 / 0) are held fixed, and the seed is fixed at 42 — v1 (`02_split_params`) already showed
+the optimiser is **seed-stable** (its three seed replicates landed on the same split; residual recall
+spread ≈ 0.007 was model-training stochasticity). For each scenario the model is re-tuned for
+`nrounds` via image-grouped `xgb.cv` and evaluated on **that split's own held-out images**.
+
+> **Read this like v1, not the model report.** Every scenario has a *different* held-out test set, so
+> a single high number can just mean "easier images landed in test." The factorial's payoff is **§5
+> marginal effects**: averaging over the other two knobs cancels much of that noise and isolates what
+> each knob actually does. Treat the noise floor as ≈ 0.007 (from v1) — gaps smaller than that are
+> not real. We rank on **critical-class recall** (`AccuracyNull ≈ 0.84`, so raw accuracy hides rare
+> cells).
+
+# 1. The split knobs being varied (3 levels each)
+
+- **`tier_test_frac` (critical: 0.20 / 0.30 / 0.40)** — share of each critical type's cells *targeted*
+  for test. Higher → more rare cells in test (steadier recall estimate) but fewer left to train on.
+- **`tier_weight` (critical: 1 / 40 / 100)** — how hard the optimiser hits the critical target. `1`
+  removes tier priority (critical treated like any class); `100` forces it almost regardless of cost
+  to other tiers.
+- **`min_test_count` (critical: 0 / 8 / 15)** — hard floor of critical cells per type in test. `0` =
+  no guarantee; `15` may be infeasible for the rarest types (Igg n=13, NK n=12) and pull whole images
+  in to compensate.
+
+# 2. The factorial grid
+
+```{r grid-table}
+knitr::kable(split_grid[, c("frac_crit", "w_crit", "min_crit", "seed", "note")],
+             caption = "27-cell factorial (critical frac × weight × floor); model (M9) + cleaning held constant")
+```
+
+```{r fixed-model}
+knitr::kable(as.data.frame(best_xgb),
+             caption = "Fixed model across all 27 splits: M9 'conservative' XGBoost params")
+```
+
+# 3. Scenario results (sorted by critical-class recall)
+
+Test cells/images vary per scenario (shown), so single-row gaps mix split strategy with test-set
+composition — read §5 for the de-noised picture.
+
+```{r scenario-table}
+tab <- res |>
+  dplyr::arrange(dplyr::desc(Sensitivity_critical_mean_test)) |>
+  dplyr::transmute(
+    model_id, fracC, wC, floor,
+    Accuracy_test  = r3(Accuracy_test),
+    Kappa_test     = r3(Kappa_test),
+    Sens_crit_test = r3(Sensitivity_critical_mean_test),
+    F1_crit_test   = r3(F1_critical_mean_test),
+    n_test_cells, n_test_images, nrounds_best)
+knitr::kable(tab, caption = "Held-out test metrics per split scenario (best = top)")
+```
+
+# 4. Per-class critical sensitivity (recall) matrix
+
+```{r sens-matrix}
+sens_cols <- paste0("Sens_", critical, "_test")
+m <- res[, c("model_id", "fracC", "wC", "floor", sens_cols)]
+colnames(m) <- c("id", "frac", "w", "floor", critical)
+m[critical] <- lapply(m[critical], r3)
+m <- m[order(-rowMeans(sapply(m[critical], as.numeric), na.rm = TRUE)), ]
+knitr::kable(m, row.names = FALSE,
+             caption = "Per-class test recall for the 6 critical cell types (higher = better)")
+```
+
+# 5. Marginal effects — what each knob actually does
+
+Each table averages a metric over the **other two** knobs (9 scenarios per level). This is the part
+the factorial is for: it cancels most of the test-set-composition noise and shows the knob's own
+effect. Compare differences against the ≈ 0.007 noise floor.
+
+```{r marginal-effects}
+marg <- function(by) {
+  res |>
+    dplyr::group_by(.level = .data[[by]]) |>
+    dplyr::summarise(
+      n_scen        = dplyr::n(),
+      Acc           = r3(mean(Accuracy_test)),
+      Kappa         = r3(mean(Kappa_test)),
+      Sens_crit     = r3(mean(Sensitivity_critical_mean_test)),
+      F1_crit       = r3(mean(F1_critical_mean_test)),
+      n_test_cells  = round(mean(n_test_cells)),
+      n_test_images = round(mean(n_test_images), 1),
+      .groups = "drop") |>
+    dplyr::rename(!!by := .level)
+}
+knitr::kable(marg("fracC"), caption = "Marginal effect of critical TEST-FRACTION (averaged over weight × floor)")
+knitr::kable(marg("wC"),    caption = "Marginal effect of critical WEIGHT (averaged over fraction × floor)")
+knitr::kable(marg("floor"), caption = "Marginal effect of critical FLOOR (averaged over fraction × weight)")
+```
+
+Critical-recall as a **fraction × weight** grid (averaged over the floor levels) — look for whether
+the fraction effect depends on the weight (interaction) or is roughly additive:
+
+```{r interaction-grid}
+inter <- res |>
+  dplyr::group_by(fracC, wC) |>
+  dplyr::summarise(Sens_crit = r3(mean(Sensitivity_critical_mean_test)), .groups = "drop") |>
+  tidyr::pivot_wider(names_from = wC, values_from = Sens_crit, names_prefix = "w=")
+knitr::kable(inter, caption = "Mean critical recall by critical fraction (rows) × weight (cols), over floor levels")
+```
+
+# 6. Per-iteration detail
+
+```{r iterations, results='asis'}
+analyse_row <- function(r) {
+  sv <- as.numeric(r[paste0("Sens_", critical, "_test")]); names(sv) <- critical
+  missed <- names(sv)[!is.na(sv) & sv < 0.5]
+  msgs <- c()
+  if (length(missed)) msgs <- c(msgs, paste0("missed (recall<0.5): ", paste(missed, collapse = ", ")))
+  if (r$Accuracy_test - r$AccuracyNull_test < 0.05)
+    msgs <- c(msgs, "accuracy barely above the majority-Tumor null — leaning on the dominant class")
+  if (r$Precision_critical_mean_test < r$Sensitivity_critical_mean_test - 0.1)
+    msgs <- c(msgs, "critical classes over-predicted (precision < recall)")
+  if (!length(msgs)) msgs <- "no critical class below recall 0.5; balanced precision/recall"
+  paste(msgs, collapse = "; ")
+}
+
+ord <- order(-res$Sensitivity_critical_mean_test)
+for (i in ord) {
+  r <- res[i, ]
+  cat(sprintf("\n\n## %s — frac=%.2f, weight=%s, floor=%s\n\n",
+              r$model_id, r$fracC, r$wC, r$floor))
+
+  cat("**Split params (test-fraction targets / weights / floor)**\n\n")
+  print(knitr::kable(data.frame(
+    tier      = c("critical", "medium", "non_critical"),
+    test_frac = c(r$tier_test_frac_critical, r$tier_test_frac_medium, r$tier_test_frac_noncrit),
+    weight    = c(r$tier_weight_critical, r$tier_weight_medium, r$tier_weight_noncrit),
+    min_test  = c(r$min_test_count_critical, 5, 0), row.names = NULL)))
+  cat(sprintf("\n\nseed = %s | Train %d cells / Test %d cells across %d test images.\n\n",
+              r$seed, r$n_train_cells, r$n_test_cells, r$n_test_images))
+
+  sp <- split_store[[r$model_id]]
+  if (!is.null(sp)) {
+    cat("\n**Achieved split** (per-class counts and achieved test fraction)\n\n")
+    print(knitr::kable(sp))
+  }
+
+  cat("\n\n**Test metrics**\n\n")
+  print(knitr::kable(data.frame(
+    Accuracy = r3(r$Accuracy_test), Kappa = r3(r$Kappa_test),
+    Lower = r3(r$AccuracyLower_test), Upper = r3(r$AccuracyUpper_test),
+    Null = r3(r$AccuracyNull_test), Sens_crit = r3(r$Sensitivity_critical_mean_test),
+    F1_crit = r3(r$F1_critical_mean_test), nrounds_best = r$nrounds_best, row.names = NULL)))
+
+  cm <- cm_store[[r$model_id]]
+  if (!is.null(cm)) {
+    cat("\n\n**Confusion matrix** (rows = Prediction, cols = Reference)\n\n")
+    print(knitr::kable(as.data.frame.matrix(cm)))
+  }
+  cat("\n\n**Analysis:** ", analyse_row(r), "\n\n")
+}
+```
+
+# 7. Conclusion — best split & which knob matters
+
+```{r conclusion, results='asis'}
+acc_floor <- 0.93; kappa_floor <- 0.85
+elig <- res[res$Accuracy_test >= acc_floor & res$Kappa_test >= kappa_floor, ]
+elig <- elig[order(-elig$Sensitivity_critical_mean_test, -elig$F1_critical_mean_test,
+                   -elig$Kappa_test), ]
+best <- res[res$model_id == best_s_id, ][1, ]
+
+# marginal spreads (effect size of each knob on mean critical recall)
+spread <- function(by) {
+  a <- tapply(res$Sensitivity_critical_mean_test, res[[by]], mean)
+  max(a) - min(a)
+}
+sp_frac <- spread("fracC"); sp_w <- spread("wC"); sp_floor <- spread("floor")
+ranked_knob <- sort(c(`test-fraction` = sp_frac, weight = sp_w, floor = sp_floor), decreasing = TRUE)
+
+cat(sprintf(
+"**Guardrail:** Accuracy_test ≥ %.2f and Kappa_test ≥ %.2f → %d/%d scenarios eligible.\n\n",
+acc_floor, kappa_floor, nrow(elig), nrow(res)))
+
+cat(sprintf(
+"**Selected split: %s** (critical frac = %.2f, weight = %s, floor = %s)\n\n- Held-out test: Accuracy = %.3f, Kappa = %.3f (null = %.3f)\n- Critical-class recall = %.3f, critical F1 = %.3f\n- Test set: %d cells / %d images; model re-tuned to nrounds = %s\n\n",
+best$model_id, best$fracC, best$wC, best$floor,
+best$Accuracy_test, best$Kappa_test, best$AccuracyNull_test,
+best$Sensitivity_critical_mean_test, best$F1_critical_mean_test,
+best$n_test_cells, best$n_test_images, best$nrounds_best))
+
+cat("**Knob influence on mean critical recall (marginal spread, vs ≈0.007 noise floor):**\n\n")
+for (nm in names(ranked_knob))
+  cat(sprintf("- %s: %.3f%s\n", nm, ranked_knob[[nm]],
+              if (ranked_knob[[nm]] < 0.01) "  (within noise — negligible)" else ""))
+```
+
+**Takeaways**
+
+- The model is identical in all 27 rows — this measures the **evaluation split**, not the classifier.
+  The "best split" is the most trustworthy rare-cell estimate, not a better model.
+- Trust **§5 marginals over §3 single rows**: any knob whose marginal spread is under ≈0.007 (the v1
+  noise floor) is doing nothing measurable to rare-class recall — it's just moving which images test.
+- The **floor** mainly governs *feasibility*: watch the achieved-split tables (§6) for a critical
+  class left under its floor (recall then unestimable) or a high floor (15) dragging extra images into
+  test and shrinking the training set.
+- A high **test-fraction** can inflate test recall while starving training of rare cells — confirm any
+  apparent win against the production split (v1 S1: frac 0.30 / weight 40 / floor 8).
+```
